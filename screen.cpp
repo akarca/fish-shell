@@ -170,10 +170,10 @@ struct prompt_layout_t
 {
     /* How many lines the prompt consumes */
     size_t line_count;
-    
+
     /* Width of the longest line */
     size_t max_line_width;
-    
+
     /* Width of the last line */
     size_t last_line_width;
 };
@@ -187,7 +187,7 @@ static prompt_layout_t calc_prompt_layout(const wchar_t *prompt)
 {
     size_t current_line_width = 0;
     size_t j, k;
-    
+
     prompt_layout_t prompt_layout = {};
     prompt_layout.line_count = 1;
 
@@ -456,7 +456,7 @@ static void s_check_status(screen_t *s)
         */
 
         int prev_line = s->actual.cursor.y;
-        write_loop(1, "\r", 1);
+        write_loop(STDOUT_FILENO, "\r", 1);
         s_reset(s, screen_reset_current_line_and_prompt);
         s->actual.cursor.y = prev_line;
     }
@@ -566,6 +566,22 @@ static void s_move(screen_t *s, data_buffer_t *b, int new_x, int new_y)
 {
     if (s->actual.cursor.x == new_x && s->actual.cursor.y == new_y)
         return;
+    
+    // If we are at the end of our window, then either the cursor stuck to the edge or it didn't. We don't know! We can fix it up though.
+    if (s->actual.cursor.x == common_get_width()) {
+        // Either issue a cr to go back to the beginning of this line, or a nl to go to the beginning of the next one, depending on what we think is more efficient
+        if (new_y <= s->actual.cursor.y)
+        {
+            b->push_back('\r');
+        }
+        else
+        {
+            b->push_back('\n');
+            s->actual.cursor.y++;
+        }
+        // Either way we're not in the first column
+        s->actual.cursor.x = 0;
+    }
 
     int i;
     int x_steps, y_steps;
@@ -661,9 +677,7 @@ static void s_write_char(screen_t *s, data_buffer_t *b, wchar_t c)
         s->soft_wrap_location.x = 0;
         s->soft_wrap_location.y = s->actual.cursor.y + 1;
 
-        /* If auto_right_margin is set, then the cursor sticks to the right edge when it's in the rightmost column, so reflect that fact */
-        if (auto_right_margin)
-            s->actual.cursor.x--;
+        /* Note that our cursor position may be a lie: Apple Terminal makes the right cursor stick to the margin, while Ubuntu makes it "go off the end" (but still doesn't wrap). We rely on s_move to fix this up. */
     }
     else
     {
@@ -741,52 +755,48 @@ static bool test_stuff(screen_t *scr)
 {
     data_buffer_t output;
     scoped_buffer_t scoped_buffer(&output);
-    
+
     s_move(scr, &output, 0, 0);
     int screen_width = common_get_width();
-    
+
     const wchar_t *left = L"left";
     const wchar_t *right = L"right";
-    
-    for (size_t idx = 0; left[idx]; idx++)
+
+    for (size_t idx = 0; idx < 80; idx++)
     {
-        s_write_char(scr, &output, left[idx]);
+        output.push_back('A');
     }
-    
-    s_move(scr, &output, screen_width - wcslen(right), 0);
-    
-    for (size_t idx = 0; right[idx]; idx++)
-    {
-        s_write_char(scr, &output, right[idx]);
-    }
-    
+
     if (! output.empty())
     {
-        write_loop(1, &output.at(0), output.size());
+        write_loop(STDOUT_FILENO, &output.at(0), output.size());
         output.clear();
     }
-    
+
     sleep(5);
-    
-    for (size_t i=0; i < 1; i++) {
+
+    for (size_t i=0; i < 1; i++)
+    {
         writembs(cursor_left);
     }
-    
+
     if (! output.empty())
     {
         write_loop(1, &output.at(0), output.size());
         output.clear();
     }
 
-    
 
-    while (1) {
+
+    while (1)
+    {
         int c = getchar();
         if (c != EOF) break;
     }
 
-    
-    while (1) {
+
+    while (1)
+    {
         int c = getchar();
         if (c != EOF) break;
     }
@@ -826,13 +836,13 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
             need_clear_screen = true;
             s_move(scr, &output, 0, 0);
             s_reset(scr, screen_reset_current_line_contents);
-            
+
             need_clear_lines = need_clear_lines || scr->need_clear_lines;
             need_clear_screen = need_clear_screen || scr->need_clear_screen;
         }
         scr->actual_width = screen_width;
     }
-    
+
     scr->need_clear_lines = false;
     scr->need_clear_screen = false;
 
@@ -876,9 +886,21 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
                     skip_remaining = prefix_width;
             }
 
-            /* Don't skip over the last two characters in a soft-wrapped line, so that we maintain soft-wrapping */
-            if (o_line.is_soft_wrapped)
-                skip_remaining = mini(skip_remaining, (size_t)(scr->actual_width - 2));
+            /* If we're soft wrapped, and if we're going to change the first character of the next line, don't skip over the last two characters so that we maintain soft-wrapping */
+            if (o_line.is_soft_wrapped && i + 1 < scr->desired.line_count()) {
+                bool first_character_of_next_line_will_change = true;
+                if (i + 1 < scr->actual.line_count())
+                {
+                    if (line_shared_prefix(scr->desired.line(i+1), scr->actual.line(i+1)) > 0)
+                    {
+                        first_character_of_next_line_will_change = false;
+                    }
+                }
+                if (first_character_of_next_line_will_change)
+                {
+                    skip_remaining = mini(skip_remaining, (size_t)(scr->actual_width - 2));
+                }
+            }
         }
 
         /* Skip over skip_remaining width worth of characters */
@@ -910,14 +932,14 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
                 s_write_mbs(&output, clr_eos);
                 has_cleared_screen = true;
             }
-        
+
             perform_any_impending_soft_wrap(scr, current_width, (int)i);
             s_move(scr, &output, current_width, (int)i);
             s_set_color(scr, &output, o_line.color_at(j));
             s_write_char(scr, &output, o_line.char_at(j));
             current_width += fish_wcwidth_min_0(o_line.char_at(j));
         }
-        
+
         /* Clear the screen if we have not done so yet. */
         if (should_clear_screen_this_line && ! has_cleared_screen)
         {
@@ -960,12 +982,12 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
             s_set_color(scr, &output, 0xffffffff);
             s_write_str(&output, right_prompt);
             scr->actual.cursor.x += right_prompt_width;
-            
-            /* We output in the last column. Some terms (Linux) push the cursor further right, past the window. Others make it "stick." Since we don't really know which is which, issue a cr so it goes back to the left. 
-            
+
+            /* We output in the last column. Some terms (Linux) push the cursor further right, past the window. Others make it "stick." Since we don't really know which is which, issue a cr so it goes back to the left.
+
                However, if the user is resizing the window smaller, then it's possible the cursor wrapped. If so, then a cr will go to the beginning of the following line! So instead issue a bunch of "move left" commands to get back onto the line, and then jump to the front of it (!)
             */
-            
+
             s_move(scr, &output, scr->actual.cursor.x - (int)right_prompt_width, scr->actual.cursor.y);
             s_write_str(&output, L"\r");
             scr->actual.cursor.x = 0;
@@ -1051,7 +1073,7 @@ static screen_layout_t compute_layout(screen_t *s,
 
     prompt_layout_t left_prompt_layout = calc_prompt_layout(left_prompt);
     prompt_layout_t right_prompt_layout = calc_prompt_layout(right_prompt);
-    
+
     size_t left_prompt_width = left_prompt_layout.last_line_width;
     size_t right_prompt_width = right_prompt_layout.last_line_width;
 
@@ -1122,9 +1144,9 @@ static screen_layout_t compute_layout(screen_t *s,
     2. Left prompt visible, right prompt visible, command line visible, autosuggestion truncated (possibly to zero)
     3. Left prompt visible, right prompt hidden, command line visible, autosuggestion hidden
     4. Newline separator (left prompt visible, right prompt hidden, command line visible, autosuggestion visible)
-    
+
     A remark about layout #4: if we've pushed the command line to a new line, why can't we draw the right prompt? The issue is resizing: if you resize the window smaller, then the right prompt will wrap to the next line. This means that we can't go back to the line that we were on, and things turn to chaos very quickly.
-    
+
     */
 
     bool done = false;
@@ -1208,9 +1230,9 @@ void s_write(screen_t *s,
         const std::string prompt_narrow = wcs2string(left_prompt);
         const std::string command_line_narrow = wcs2string(explicit_command_line);
 
-        write_loop(1, "\r", 1);
-        write_loop(1, prompt_narrow.c_str(), prompt_narrow.size());
-        write_loop(1, command_line_narrow.c_str(), command_line_narrow.size());
+        write_loop(STDOUT_FILENO, "\r", 1);
+        write_loop(STDOUT_FILENO, prompt_narrow.c_str(), prompt_narrow.size());
+        write_loop(STDOUT_FILENO, command_line_narrow.c_str(), command_line_narrow.size());
 
         return;
     }
@@ -1310,10 +1332,10 @@ void s_reset(screen_t *s, screen_reset_mode_t mode)
     {
         s->actual_lines_before_reset =  maxi(s->actual_lines_before_reset, s->actual.line_count());
     }
-    
+
     if (repaint_prompt && ! abandon_line)
     {
-        
+
         /* If the prompt is multi-line, we need to move up to the prompt's initial line. We do this by lying to ourselves and claiming that we're really below what we consider "line 0" (which is the last line of the prompt). This will cause us to move up to try to get back to line 0, but really we're getting back to the initial line of the prompt. */
         const size_t prompt_line_count = calc_prompt_lines(s->actual_left_prompt);
         assert(prompt_line_count >= 1);
@@ -1330,10 +1352,31 @@ void s_reset(screen_t *s, screen_reset_mode_t mode)
     s->need_clear_lines = true;
     s->need_clear_screen = s->need_clear_screen || clear_to_eos;
 
+    if (abandon_line)
+    {
+        /* Do the PROMPT_SP hack */
+        int screen_width = common_get_width();
+        wcstring abandon_line_string;
+        abandon_line_string.reserve(screen_width);
+
+        int non_space_width = wcwidth(omitted_newline_char);
+        if (screen_width >= non_space_width)
+        {
+            abandon_line_string.append(L"\x1b[7m"); //invert text ANSI escape sequence
+            abandon_line_string.push_back(omitted_newline_char);
+            abandon_line_string.append(L"\x1b[0m"); //normal text ANSI escape sequence
+            abandon_line_string.append(screen_width - non_space_width, L' ');
+        }
+        abandon_line_string.push_back(L'\r');
+        const std::string narrow_abandon_line_string = wcs2string(abandon_line_string);
+        write_loop(STDOUT_FILENO, narrow_abandon_line_string.c_str(), narrow_abandon_line_string.size());
+        s->actual.cursor.x = 0;
+    }
+
     if (! abandon_line)
     {
         /* This should prevent resetting the cursor position during the next repaint. */
-        write_loop(1, "\r", 1);
+        write_loop(STDOUT_FILENO, "\r", 1);
         s->actual.cursor.x = 0;
     }
 

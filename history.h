@@ -8,10 +8,20 @@
 #include <wchar.h>
 #include "common.h"
 #include "pthread.h"
+#include "wutil.h"
 #include <vector>
 #include <utility>
 #include <list>
 #include <set>
+
+/* fish supports multiple shells writing to history at once. Here is its strategy:
+
+1. All history files are append-only. Data, once written, is never modified.
+2. A history file may be re-written ("vacuumed"). This involves reading in the file and writing a new one, while performing maintenance tasks: discarding items in an LRU fashion until we reach the desired maximum count, removing duplicates, and sorting them by timestamp (eventually, not implemented yet). The new file is atomically moved into place via rename().
+3. History files are mapped in via mmap(). Before the file is mapped, the file takes a fcntl read lock. The purpose of this lock is to avoid seeing a transient state where partial data has been written to the file.
+4. History is appended to under a fcntl write lock.
+5. The chaos_mode boolean can be set to true to do things like lower buffer sizes which can trigger race conditions. This is useful for testing.
+*/
 
 typedef std::vector<wcstring> path_list_t;
 
@@ -111,14 +121,14 @@ private:
     /** The name of this list. Used for picking a suitable filename and for switching modes. */
     const wcstring name;
 
-    /** New items. */
+    /** New items. Note that these are NOT discarded on save. We need to keep these around so we can distinguish between items in our history and items in the history of other shells that were started after we were started. */
     std::vector<history_item_t> new_items;
+
+    /** The index of the first new item that we have not yet written. */
+    size_t first_unwritten_new_item_index;
 
     /** Deleted item contents. */
     std::set<wcstring> deleted_items;
-
-    /** How many items we've added without saving */
-    size_t unsaved_item_count;
 
     /** The mmaped region for the history file */
     const char *mmap_start;
@@ -129,12 +139,16 @@ private:
     /** The type of file we mmap'd */
     history_file_type_t mmap_type;
 
+    /** The file ID of the file we mmap'd */
+    file_id_t mmap_file_id;
+
     /** Timestamp of when this history was created */
     const time_t birth_timestamp;
 
-    /** Timestamp of last save */
-    time_t save_timestamp;
+    /** How many items we add until the next vacuum. Initially a random value. */
+    int countdown_to_vacuum;
 
+    /** Figure out the offsets of our mmap data */
     void populate_from_mmap(void);
 
     /** List of old items, as offsets into out mmap data */
@@ -146,11 +160,23 @@ private:
     /** Loads old if necessary */
     bool load_old_if_needed(void);
 
+    /** Memory maps the history file if necessary */
+    bool mmap_if_needed(void);
+
     /** Deletes duplicates in new_items. */
     void compact_new_items();
 
+    /** Saves history by rewriting the file */
+    bool save_internal_via_rewrite();
+
+    /** Saves history by appending to the file */
+    bool save_internal_via_appending();
+
     /** Saves history */
-    void save_internal();
+    void save_internal(bool vacuum);
+
+    /** Whether we're in maximum chaos mode, useful for testing */
+    bool chaos_mode;
 
     /* Versioned decoding */
     static history_item_t decode_item_fish_2_0(const char *base, size_t len);
@@ -176,6 +202,9 @@ public:
     /** Saves history */
     void save();
 
+    /** Performs a full (non-incremental) save */
+    void save_and_vacuum();
+
     /** Irreversibly clears history */
     void clear();
 
@@ -187,8 +216,6 @@ public:
 
     /** Return the specified history at the specified index. 0 is the index of the current commandline. (So the most recent item is at index 1.) */
     history_item_t item_at_index(size_t idx);
-
-    bool is_deleted(const history_item_t &item) const;
 };
 
 class history_search_t
