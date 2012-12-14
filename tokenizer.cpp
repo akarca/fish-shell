@@ -669,43 +669,81 @@ void tok_set_pos(tokenizer_t *tok, int pos)
 }
 
 
-#ifdef TOKENIZER_TEST
 
-/**
-   This main function is used for compiling the tokenizer_test command, used for testing the tokenizer.
-*/
-int main(int argc, char **argv)
+move_word_state_machine_t::move_word_state_machine_t() : state(s_whitespace)
 {
-    tokenizer tok;
-    int i;
-    for (i=1; i<argc; i++)
-    {
-        wprintf(L"Tokenizing string %s\n", argv[i]);
-        for (tok_init(&tok, str2wcs(argv[i]), 0); tok_has_next(&tok); tok_next(&tok))
-        {
-            switch (tok_last_type(&tok))
-            {
-                case TOK_INVALID:
-                    wprintf(L"Type: INVALID\n");
-                    break;
-                case TOK_STRING:
-                    wprintf(L"Type: STRING\t Value: %ls\n", tok_last(&tok));
-                    break;
-                case TOK_PIPE:
-                    wprintf(L"Type: PIPE\n");
-                    break;
-                case TOK_END:
-                    wprintf(L"Type: END\n");
-                    break;
-                case TOK_ERROR:
-                    wprintf(L"Type: ERROR\n");
-                    break;
-                default:
-                    wprintf(L"Type: Unknown\n");
-                    break;
-            }
-        }
-    }
 }
 
-#endif
+bool move_word_state_machine_t::consume_char(wchar_t c)
+{
+    //printf("state %d, consume '%lc'\n", state, c);
+    bool consumed = false;
+    /* Always treat separators as first. All this does is ensure that we treat ^ as a string character instead of as stderr redirection, which I hypothesize is usually what is desired. */
+    bool was_first = true;
+    while (state != s_end && ! consumed)
+    {
+        switch (state)
+        {
+            case s_whitespace:
+                if (iswspace(c))
+                {
+                    /* Consumed whitespace */
+                    consumed = true;
+                }
+                else if (tok_is_string_character(c, was_first))
+                {
+                    /* String path */
+                    state = s_slash;
+                }
+                else
+                {
+                    /* Separator path */
+                    state = s_separator;
+                }
+                break;
+
+            case s_separator:
+                if (! iswspace(c) && ! tok_is_string_character(c, was_first))
+                {
+                    /* Consumed separator */
+                    consumed = true;
+                }
+                else
+                {
+                    state = s_end;
+                }
+                break;
+
+            case s_slash:
+                if (c == L'/')
+                {
+                    /* Consumed slash */
+                    consumed = true;
+                }
+                else
+                {
+                    state = s_nonseparators_except_slash;
+                }
+                break;
+
+            case s_nonseparators_except_slash:
+                if (c != L'/' && tok_is_string_character(c, was_first))
+                {
+                    /* Consumed string character except slash */
+                    consumed = true;
+                }
+                else
+                {
+                    state = s_end;
+                }
+                break;
+
+                /* We won't get here, but keep the compiler happy */
+            case s_end:
+            default:
+                break;
+        }
+    }
+    return consumed;
+}
+
