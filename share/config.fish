@@ -96,3 +96,4 @@ function __fish_on_interactive --on-event fish_prompt
 	functions -e __fish_on_interactive
 end
 
+. $fish_function_path[-1]/virtual.fish

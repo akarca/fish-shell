@@ -27,56 +27,18 @@ function acvirtualenv --description "Activate a virtualenv"
 		devirtualenv
 	end
 
-	emit virtualenv_will_activate
-	emit virtualenv_will_activate:$argv[1]
-
 	set -gx VIRTUAL_ENV $VIRTUALFISH_HOME/$argv[1]
-	set -g _VF_EXTRA_PATH $VIRTUAL_ENV/bin
-	set -gx PATH $_VF_EXTRA_PATH $PATH
 	. $VIRTUAL_ENV/bin/activate.fish
 
-	# hide PYTHONHOME
-	if set -q PYTHONHOME
-		set -g _VF_OLD_PYTHONHOME $PYTHONHOME
-		set -e PYTHONHOME
-	end
-
-	emit virtualenv_did_activate
-	emit virtualenv_did_activate:(basename $VIRTUAL_ENV)
 end
 
 function devirtualenv --description "Deactivate the currently-activated virtualenv"
-
-	emit virtualenv_will_deactivate
-	emit virtualenv_will_deactivate:(basename $VIRTUAL_ENV)
-
-	# find elements to remove from PATH
-	set to_remove
-	for i in (seq (count $PATH))
-		if contains $PATH[$i] $_VF_EXTRA_PATH
-			set to_remove $to_remove $i
-		end
-	end
-
-	# remove them
-	for i in $to_remove
-		set -e PATH[$i]
-	end
-
-	# restore PYTHONHOME
-	if set -q _VF_OLD_PYTHONHOME
-		set -gx PYTHONHOME $_VF_OLD_PYTHONHOME
-		set -e _VF_OLD_PYTHONHOME
-	end
-
 	# remove autoactivated flag
 	if set -q VF_AUTO_ACTIVATED
 		set -e VF_AUTO_ACTIVATED
 	end
 
-	emit virtualenv_did_deactivate
-	emit virtualenv_did_deactivate:(basename $VIRTUAL_ENV)
-
+	deactivate (basename $VIRTUAL_ENV)
 	set -e VIRTUAL_ENV
 end
 
