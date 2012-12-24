@@ -646,16 +646,15 @@ void exec(parser_t &parser, job_t *j)
 
     }
 
-    pipe_read.fd=0;
-    pipe_write.fd=1;
-    pipe_read.io_mode=IO_PIPE;
-    pipe_read.param1.pipe_fd[0] = -1;
-    pipe_read.param1.pipe_fd[1] = -1;
+    pipe_read.fd = 0;
+    pipe_read.io_mode = IO_PIPE;
     pipe_read.is_input = 1;
+    pipe_read.param1.pipe_fd[0] = pipe_read.param1.pipe_fd[1] = -1;
 
-    pipe_write.io_mode=IO_PIPE;
+    pipe_write.fd = 1;
+    pipe_write.io_mode = IO_PIPE;
     pipe_write.is_input = 0;
-    pipe_write.param1.pipe_fd[0]=pipe_write.param1.pipe_fd[1]=-1;
+    pipe_write.param1.pipe_fd[0] = pipe_write.param1.pipe_fd[1] = -1;
 
     j->io.push_back(&pipe_write);
 
@@ -1129,7 +1128,7 @@ void exec(parser_t &parser, job_t *j)
 
             case INTERNAL_BUILTIN:
             {
-                int skip_fork;
+                bool skip_fork;
 
                 /*
                   Handle output from builtin commands. In the general
@@ -1165,7 +1164,7 @@ void exec(parser_t &parser, job_t *j)
                 {
                     const std::string res = wcs2string(get_stdout_buffer());
                     io->out_buffer_append(res.c_str(), res.size());
-                    skip_fork = 1;
+                    skip_fork = true;
                 }
 
                 if (! skip_fork && j->io.empty())
@@ -1179,7 +1178,7 @@ void exec(parser_t &parser, job_t *j)
                     const std::string outbuff = wcs2string(out);
                     const std::string errbuff = wcs2string(err);
                     do_builtin_io(outbuff.data(), outbuff.size(), errbuff.data(), errbuff.size());
-                    skip_fork = 1;
+                    skip_fork = true;
                 }
 
                 for (io_chain_t::iterator iter = j->io.begin(); iter != j->io.end(); iter++)
@@ -1187,7 +1186,7 @@ void exec(parser_t &parser, job_t *j)
                     io_data_t *tmp_io = *iter;
                     if (tmp_io->io_mode == IO_FILE && strcmp(tmp_io->filename_cstr, "/dev/null") != 0)
                     {
-                        skip_fork = 0;
+                        skip_fork = false;
                         break;
                     }
                 }
@@ -1211,12 +1210,12 @@ void exec(parser_t &parser, job_t *j)
 
                 /* Get the strings we'll write before we fork (since they call malloc) */
                 const wcstring &out = get_stdout_buffer(), &err = get_stderr_buffer();
-                
+
                 /* These strings may contain embedded nulls, so don't treat them as C strings */
                 const std::string outbuff_str = wcs2string(out);
                 const char *outbuff = outbuff_str.data();
                 size_t outbuff_len = outbuff_str.size();
-                
+
                 const std::string errbuff_str = wcs2string(err);
                 const char *errbuff = errbuff_str.data();
                 size_t errbuff_len = errbuff_str.size();
@@ -1418,8 +1417,6 @@ void exec(parser_t &parser, job_t *j)
 static int exec_subshell_internal(const wcstring &cmd, wcstring_list_t *lst)
 {
     ASSERT_IS_MAIN_THREAD();
-    char *begin, *end;
-    char z=0;
     int prev_subshell = is_subshell;
     int status, prev_status;
     io_data_t *io_buffer;
@@ -1462,57 +1459,31 @@ static int exec_subshell_internal(const wcstring &cmd, wcstring_list_t *lst)
 
     is_subshell = prev_subshell;
 
-    io_buffer->out_buffer_append(&z, 1);
-
-    begin=end=io_buffer->out_buffer_ptr();
-
-    if (lst)
+    if (lst != NULL)
     {
-        while (1)
+        const char *begin = io_buffer->out_buffer_ptr();
+        const char *end = begin + io_buffer->out_buffer_size();
+        const char *cursor = begin;
+        while (cursor < end)
         {
-            if (*end == 0)
+            // Look for the next separator
+            const char *stop = (const char *)memchr(cursor, sep, end - cursor);
+            const bool hit_separator = (stop != NULL);
+            if (! hit_separator)
             {
-                if (begin != end)
-                {
-                    wchar_t *el = str2wcs(begin);
-                    if (el)
-                    {
-                        lst->push_back(el);
-
-                        free(el);
-                    }
-                    else
-                    {
-                        debug(2, L"Got null string on line %d of file %s", __LINE__, __FILE__);
-                    }
-                }
-                io_buffer_destroy(io_buffer);
-
-                return status;
+                // If it's not found, just use the end
+                stop = end;
             }
-            else if (*end == sep)
-            {
-                wchar_t *el;
-                *end=0;
-                el = str2wcs(begin);
-                if (el)
-                {
-                    lst->push_back(el);
+            // Stop now points at the first character we do not want to copy
+            const wcstring wc = str2wcstring(cursor, stop - cursor);
+            lst->push_back(wc);
 
-                    free(el);
-                }
-                else
-                {
-                    debug(2, L"Got null string on line %d of file %s", __LINE__, __FILE__);
-                }
-                begin = end+1;
-            }
-            end++;
+            // If we hit a separator, skip over it; otherwise we're at the end
+            cursor = stop + (hit_separator ? 1 : 0);
         }
     }
 
     io_buffer_destroy(io_buffer);
-
     return status;
 }
 

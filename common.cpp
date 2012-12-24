@@ -81,7 +81,6 @@ parts of fish.
 #include "fallback.cpp"
 
 
-
 struct termios shell_modes;
 
 // Note we foolishly assume that pthread_t is just a primitive. But it might be a struct.
@@ -139,7 +138,7 @@ int fgetws2(wcstring *s, FILE *f)
 
         c = getwc(f);
 
-        if (errno == EILSEQ)
+        if (errno == EILSEQ || errno == EINTR)
         {
             continue;
         }
@@ -163,97 +162,97 @@ int fgetws2(wcstring *s, FILE *f)
     }
 }
 
-wchar_t *str2wcs(const char *in)
+/**
+   Converts the narrow character string \c in into it's wide
+   equivalent, stored in \c out. \c out must have enough space to fit
+   the entire string.
+
+   The string may contain embedded nulls.
+
+   This function encodes illegal character sequences in a reversible
+   way using the private use area.
+*/
+
+static wcstring str2wcs_internal(const char *in, const size_t in_len)
 {
-    wchar_t *out;
-    size_t len = strlen(in);
+    if (in_len == 0)
+        return wcstring();
 
-    out = (wchar_t *)malloc(sizeof(wchar_t)*(len+1));
+    assert(in != NULL);
 
-    if (!out)
+    wcstring result;
+    result.reserve(in_len);
+    mbstate_t state = {};
+    size_t in_pos = 0;
+    while (in_pos < in_len)
     {
-        DIE_MEM();
-    }
+        wchar_t wc = 0;
+        size_t ret = mbrtowc(&wc, &in[in_pos], in_len-in_pos, &state);
 
-    return str2wcs_internal(in, out);
+        /* Determine whether to encode this characters with our crazy scheme */
+        bool use_encode_direct = false;
+        if (wc >= ENCODE_DIRECT_BASE && wc < ENCODE_DIRECT_BASE+256)
+        {
+            use_encode_direct = true;
+        }
+        else if (wc == INTERNAL_SEPARATOR)
+        {
+            use_encode_direct = true;
+        }
+        else if (ret == (size_t)(-2))
+        {
+            /* Incomplete sequence */
+            use_encode_direct = true;
+        }
+        else if (ret == (size_t)(-1))
+        {
+            /* Invalid data */
+            use_encode_direct = true;
+        }
+        else if (ret > in_len - in_pos)
+        {
+            /* Other error codes? Terrifying, should never happen */
+            use_encode_direct = true;
+        }
+
+        if (use_encode_direct)
+        {
+            wc = ENCODE_DIRECT_BASE + (unsigned char)in[in_pos];
+            result.push_back(wc);
+            in_pos++;
+            bzero(&state, sizeof state);
+        }
+        else if (ret == 0)
+        {
+            /* Embedded null byte! */
+            result.push_back(L'\0');
+            in_pos++;
+            bzero(&state, sizeof state);
+        }
+        else
+        {
+            /* Normal case */
+            result.push_back(wc);
+            in_pos += ret;
+        }
+    }
+    return result;
+}
+
+wcstring str2wcstring(const char *in, size_t len)
+{
+    return str2wcs_internal(in, len);
 }
 
 wcstring str2wcstring(const char *in)
 {
-    wchar_t *tmp = str2wcs(in);
-    wcstring result = tmp;
-    free(tmp);
-    return result;
+    return str2wcs_internal(in, strlen(in));
 }
 
 wcstring str2wcstring(const std::string &in)
 {
-    wchar_t *tmp = str2wcs(in.c_str());
-    wcstring result = tmp;
-    free(tmp);
-    return result;
-}
-
-wchar_t *str2wcs_internal(const char *in, wchar_t *out)
-{
-    size_t res=0;
-    size_t in_pos=0;
-    size_t out_pos = 0;
-    mbstate_t state;
-    size_t len;
-
-    CHECK(in, 0);
-    CHECK(out, 0);
-
-    len = strlen(in);
-
-    memset(&state, 0, sizeof(state));
-
-    while (in[in_pos])
-    {
-        res = mbrtowc(&out[out_pos], &in[in_pos], len-in_pos, &state);
-
-        if (((out[out_pos] >= ENCODE_DIRECT_BASE) &&
-                (out[out_pos] < ENCODE_DIRECT_BASE+256)) ||
-                (out[out_pos] == INTERNAL_SEPARATOR))
-        {
-            out[out_pos] = ENCODE_DIRECT_BASE + (unsigned char)in[in_pos];
-            in_pos++;
-            memset(&state, 0, sizeof(state));
-            out_pos++;
-        }
-        else
-        {
-
-            switch (res)
-            {
-                case (size_t)(-2):
-                case (size_t)(-1):
-                {
-                    out[out_pos] = ENCODE_DIRECT_BASE + (unsigned char)in[in_pos];
-                    in_pos++;
-                    memset(&state, 0, sizeof(state));
-                    break;
-                }
-
-                case 0:
-                {
-                    return out;
-                }
-
-                default:
-                {
-                    in_pos += res;
-                    break;
-                }
-            }
-            out_pos++;
-        }
-
-    }
-    out[out_pos] = 0;
-
-    return out;
+    /* Handles embedded nulls! */
+    return str2wcs_internal(in.data(), in.size());
 }
 
 char *wcs2str(const wchar_t *in)
@@ -298,12 +297,12 @@ std::string wcs2string(const wcstring &input)
 {
     std::string result;
     result.reserve(input.size());
-    
+
     mbstate_t state;
     memset(&state, 0, sizeof(state));
-    
+
     char converted[MB_LEN_MAX + 1];
-    
+
     for (size_t i=0; i < input.size(); i++)
     {
         wchar_t wc = input[i];
@@ -330,7 +329,7 @@ std::string wcs2string(const wcstring &input)
             }
         }
     }
-    
+
     return result;
 }
 

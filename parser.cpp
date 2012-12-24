@@ -1237,7 +1237,7 @@ int parser_t::is_help(const wchar_t *s, int min_match) const
     min_match = maxi(min_match, 3);
 
     return (wcscmp(L"-h", s) == 0) ||
-           (len >= min_match && (wcsncmp(L"--help", s, len) == 0));
+           (len >= (size_t)min_match && (wcsncmp(L"--help", s, len) == 0));
 }
 
 job_t *parser_t::job_create(void)
@@ -2157,7 +2157,10 @@ int parser_t::parse_job(process_t *p,
                     current_tokenizer_pos=tmp;
 
                     job_set_flag(j, JOB_SKIP, 1);
-                    event_fire_generic(L"fish_command_not_found", (wchar_t *)(args.at(0).completion.c_str()));
+
+                    wcstring_list_t event_args;
+                    event_args.push_back(args.at(0).completion);
+                    event_fire_generic(L"fish_command_not_found", &event_args);
                     proc_set_last_status(err==ENOENT?STATUS_UNKNOWN_COMMAND:STATUS_NOT_EXECUTABLE);
                 }
             }
@@ -3795,7 +3798,7 @@ if_block_t::if_block_t() :
 {
 }
 
-event_block_t::event_block_t(const event_t *evt) :
+event_block_t::event_block_t(const event_t &evt) :
     block_t(EVENT),
     event(evt)
 {

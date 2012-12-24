@@ -117,6 +117,7 @@ static const wchar_t * const name_arr[] =
     L"kill-whole-line",
     L"kill-word",
     L"backward-kill-word",
+    L"backward-kill-path-component",
     L"dump-functions",
     L"history-token-search-backward",
     L"history-token-search-forward",
@@ -200,6 +201,7 @@ static const wchar_t code_arr[] =
     R_KILL_WHOLE_LINE,
     R_KILL_WORD,
     R_BACKWARD_KILL_WORD,
+    R_BACKWARD_KILL_PATH_COMPONENT,
     R_DUMP_FUNCTIONS,
     R_HISTORY_TOKEN_SEARCH_BACKWARD,
     R_HISTORY_TOKEN_SEARCH_FORWARD,
@@ -353,7 +355,7 @@ int input_init()
     }
     const env_var_t term = env_get_string(L"TERM");
     assert(! term.missing());
-    output_set_term(term.c_str());
+    output_set_term(term);
 
     input_terminfo_init();
 

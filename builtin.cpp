@@ -188,12 +188,11 @@ static void builtin_wperror(const wchar_t *s)
         stderr_buffer.append(L": ");
     }
     char *err = strerror(errno);
-    wchar_t *werr = str2wcs(err);
-    if (werr)
+    if (err)
     {
+        const wcstring werr = str2wcstring(err);
         stderr_buffer.append(werr);
         stderr_buffer.push_back(L'\n');
-        free(werr);
     }
 }
 
@@ -1010,15 +1009,16 @@ static int builtin_emit(parser_t &parser, wchar_t **argv)
 
     }
 
-    for (; woptind < argc; woptind++)
+    if (!argv[woptind])
     {
-        event_fire_generic(argv[woptind]);
+        append_format(stderr_buffer, L"%ls: expected event name\n", argv[0]);
+        return STATUS_BUILTIN_ERROR;
     }
+    const wchar_t *eventname = argv[woptind];
+    wcstring_list_t args(argv + woptind + 1, argv + argc);
+    event_fire_generic(eventname, &args);
 
     return STATUS_BUILTIN_OK;
-
-
-
 }
 
 
@@ -1100,7 +1100,7 @@ static void functions_def(const wcstring &name, wcstring &out)
     search.function_name = name;
 
     std::vector<event_t *> ev;
-    event_get(&search, &ev);
+    event_get(search, &ev);
 
     out.append(L"function ");
 
@@ -1596,13 +1596,19 @@ static int builtin_echo(parser_t &parser, wchar_t **argv)
         {
             print_newline = false;
         }
-        else if (! wcscmp(*argv, L"-s"))
-        {
-            print_spaces = false;
-        }
         else if (! wcscmp(*argv, L"-e"))
         {
             interpret_special_chars = true;
+        }
+        else if (! wcscmp(*argv, L"-ne"))
+        {
+            print_newline = false;
+            interpret_special_chars = true;
+        }
+        else if (! wcscmp(*argv, L"-s"))
+        {
+            // fish-specific extension, which we should try to nix
+            print_spaces = false;
         }
         else if (! wcscmp(*argv, L"-E"))
         {
@@ -2032,7 +2038,7 @@ static int builtin_function(parser_t &parser, wchar_t **argv)
         {
             const wchar_t *nxt = names.at(i).c_str();
             size_t l = wcslen(nxt + 2);
-            if (chars+l > common_get_width())
+            if (chars+l > (size_t)common_get_width())
             {
                 chars = 0;
                 stderr_buffer.push_back(L'\n');
@@ -3065,7 +3071,7 @@ static int builtin_source(parser_t &parser, wchar_t ** argv)
             return STATUS_BUILTIN_ERROR;
         }
 
-        fn = wrealpath(argv[1], 0);
+        fn = wrealpath(argv[1], NULL);
 
         if (!fn)
         {
