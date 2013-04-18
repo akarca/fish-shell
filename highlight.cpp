@@ -771,8 +771,8 @@ static bool autosuggest_parse_command(const wcstring &str, wcstring *out_command
             case TOK_END:
             {
                 had_cmd = false;
-                cmd.empty();
-                args.empty();
+                cmd.clear();
+                args.clear();
                 arg_pos = -1;
                 break;
             }
@@ -810,7 +810,9 @@ bool autosuggest_suggest_special(const wcstring &str, const wcstring &working_di
     wcstring_list_t parsed_arguments;
     int parsed_last_arg_pos = -1;
     if (! autosuggest_parse_command(str, &parsed_command, &parsed_arguments, &parsed_last_arg_pos))
+    {
         return false;
+    }
 
     bool result = false;
     if (parsed_command == L"cd" && ! parsed_arguments.empty())

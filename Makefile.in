@@ -69,7 +69,6 @@ LDFLAGS_FISH_INDENT = ${LDFLAGS} @LIBS_FISH_INDENT@
 LDFLAGS_FISH_PAGER = ${LDFLAGS} @LIBS_FISH_PAGER@
 LDFLAGS_FISHD = ${LDFLAGS} @LIBS_FISHD@
 LDFLAGS_MIMEDB = ${LDFLAGS} @LIBS_MIMEDB@
-LDFLAGS_SET_COLOR = ${LDFLAGS} @LIBS_SET_COLOR@
 
 #
 # Set to 1 if we have gettext
@@ -106,7 +105,8 @@ parser_keywords.o wutil.o tokenizer.o
 #
 
 BUILTIN_FILES := builtin_set.cpp builtin_commandline.cpp	\
-	builtin_ulimit.cpp builtin_complete.cpp builtin_jobs.cpp
+	builtin_ulimit.cpp builtin_complete.cpp builtin_jobs.cpp	\
+	builtin_set_color.cpp builtin_printf.cpp
 
 
 #
@@ -157,7 +157,7 @@ HDR_FILES_SRC := doc_src/index.hdr.in doc_src/commands.hdr.in doc_src/design.hdr
 # These are the generated result files
 #
 
-HDR_FILES := $(subst .hdr.in,.hdr,$(HDR_FILES_SRC))
+HDR_FILES := $(HDR_FILES_SRC:.hdr.in=.hdr)
 
 # Use a pattern rule so that Make knows to only issue one invocation
 # per http://www.gnu.org/software/make/manual/make.html#Pattern-Intro
@@ -197,14 +197,14 @@ DOC_SRC_DIR_FILES := $(HDR_FILES_SRC) $(HELP_SRC)
 # Files in ./
 #
 
-MAIN_DIR_FILES_UNSORTED := Doxyfile Doxyfile.user Doxyfile.help.in		\
-    Makefile.in configure configure.ac config.h.in install-sh			\
-    set_color.cpp key_reader.cpp $(MIME_OBJS:.o=.h)					\
-    $(MIME_OBJS:.o=.cpp) $(FISH_OBJS:.o=.h) $(BUILTIN_FILES)				\
-    $(COMMON_FILES) $(COMMON_FILES:.cpp=.h) $(FISH_OBJS:.o=.cpp)			\
-    fish.spec.in INSTALL README user_doc.head.html xsel-0.9.6.tar		\
+MAIN_DIR_FILES_UNSORTED := Doxyfile Doxyfile.user Doxyfile.help					\
+    Makefile.in configure configure.ac config.h.in install-sh					\
+    key_reader.cpp $(MIME_OBJS:.o=.h)											\
+    $(MIME_OBJS:.o=.cpp) $(FISH_OBJS:.o=.h) $(BUILTIN_FILES)					\
+    $(COMMON_FILES) $(COMMON_FILES:.cpp=.h) $(FISH_OBJS:.o=.cpp)				\
+    fish.spec.in INSTALL README user_doc.head.html								\
     ChangeLog config.sub config.guess fish_tests.cpp fish.cpp fish_pager.cpp	\
-    fishd.cpp seq.in make_vcs_completions.fish $(FISH_INDENT_OBJS:.o=.cpp)
+    fishd.cpp make_vcs_completions.fish $(FISH_INDENT_OBJS:.o=.cpp)
 
 #
 # The sorting is not meaningful in itself, but it has the side effect
@@ -241,16 +241,14 @@ FUNCTIONS_DIR_FILES := $(wildcard share/functions/*.fish)
 # Programs to install
 #
 
-SIMPLE_PROGRAMS := fish set_color mimedb fish_pager fishd fish_indent
-PROGRAMS := $(SIMPLE_PROGRAMS) @XSEL_BIN@ @SEQ_FALLBACK@
-
+PROGRAMS := fish mimedb fish_pager fishd fish_indent
 
 #
 # Manual pages to install
 #
 
-MANUALS := $(addsuffix .1, $(addprefix share/man/,	\
-	$(SIMPLE_PROGRAMS))) @XSEL_MAN_PATH@
+MANUALS := $(addsuffix .1, $(addprefix share/man/man1/,	\
+	$(PROGRAMS)))
 
 
 #
@@ -260,13 +258,6 @@ MANUALS := $(addsuffix .1, $(addprefix share/man/,	\
 TRANSLATIONS_SRC := $(wildcard po/*.po)
 TRANSLATIONS := $(TRANSLATIONS_SRC:.po=.gmo)
 
-
-#
-# Extra util
-#
-
-XSEL := @XSEL@
-XSEL_BIN := @XSEL_BIN@
 
 #
 # Make everything needed for installing fish
@@ -309,7 +300,7 @@ prof: all
 # Allow doxygen to fail, e.g. if it does not exist
 
 user_doc: $(HDR_FILES_SRC) Doxyfile.user user_doc.head.html $(HELP_SRC) doc.h $(HDR_FILES)
-	- doxygen Doxyfile.user && touch user_doc
+	- (cat Doxyfile.user ; echo PROJECT_NUMBER=@PACKAGE_VERSION@) | doxygen - && touch user_doc
 
 
 #
@@ -317,7 +308,7 @@ user_doc: $(HDR_FILES_SRC) Doxyfile.user user_doc.head.html $(HELP_SRC) doc.h $(
 #
 
 doc: *.h *.cpp doc.h Doxyfile
-	doxygen;
+	(cat Doxyfile ; echo PROJECT_NUMBER=@PACKAGE_VERSION@) | doxygen - ;
 
 
 #
@@ -342,14 +333,6 @@ test: $(PROGRAMS) fish_tests
 
 
 #
-# Build the xsel program, which is maintained in its own tarball
-#
-
-$(XSEL_BIN):
-	$(MAKE) -C $(XSEL) || echo "Failed to build xsel - either add the required dependencies or use './configure --without-xsel' to disable it."
-
-
-#
 # commands.hdr collects documentation on all commands, functions and
 # builtins
 #
@@ -367,14 +350,14 @@ doc_src/commands.hdr:$(HELP_SRC) doc_src/commands.hdr.in
 	cat $@.in | awk '{if ($$0 ~ /@command_list@/){ system("cat command_list.txt");} else{ print $$0;}}' >$@
 
 
-toc.txt: $(subst index.hdr,index.hdr.in,$(HDR_FILES))
+toc.txt: $(HDR_FILES:index.hdr=index.hdr.in)
 	-rm toc.tmp $@
-	for i in $(subst index.hdr,index.hdr.in,$(HDR_FILES)); do\
+	for i in $(HDR_FILES:index.hdr=index.hdr.in); do\
 		NAME=`basename $$i .hdr`; \
 		NAME=`basename $$NAME .hdr.in`; \
 		sed <$$i >>toc.tmp -n \
-		-e 's,.*\\page *\([^ ]*\) *\(.*\)$$,- <a href="'$$NAME'.html" name="toc-'$$NAME'">\2</a>,p' \
-		-e 's,.*\\section *\([^ ]*\) *\(.*\)$$,  - <a href="'$$NAME'.html#\1" name="toc-'$$NAME'">\2</a>,p'; \
+		-e 's,.*\\page *\([^ ]*\) *\(.*\)$$,- <a href="'$$NAME'.html" id="toc-'$$NAME'">\2</a>,p' \
+		-e 's,.*\\section *\([^ ]*\) *\(.*\)$$,  - <a href="'$$NAME'.html#\1">\2</a>,p'; \
 	done
 	mv toc.tmp $@
 
@@ -443,10 +426,10 @@ doc.h: $(HDR_FILES)
 # Create a template translation object
 #
 
-messages.pot: *.cpp *.h share/completions/*.fish share/functions/*.fish seq
+messages.pot: *.cpp *.h share/completions/*.fish share/functions/*.fish
 	if test $(HAVE_GETTEXT) = 1;then \
 		xgettext -k_ -kN_ *.cpp *.h -o messages.pot; \
-		if xgettext -j -k_ -kN_ -k--description -LShell share/completions/*.fish share/functions/*.fish seq -o messages.pot; then true; else \
+		if xgettext -j -k_ -kN_ -k--description -LShell share/completions/*.fish share/functions/*.fish -o messages.pot; then true; else \
 			echo "Your xgettext version is too old to build the messages.pot file"\
 			rm messages.pot\
 			false;\
@@ -486,25 +469,10 @@ common.o: $(COMMON_FILES)
 #
 
 share/man: $(HELP_SRC)
-	-rm doc_src/*.doxygen # Remove temp files from previous run
-	-rm -r help_doc
 	-mkdir share/man
 	touch share/man
-	for i in $(HELP_SRC); do \
-		FILE=doc_src/`basename $$i .txt`.doxygen; \
-		echo  "/** \page" `basename $$i .txt` >$$FILE; \
-		cat $$i >>$$FILE; \
-		echo "*/" >>$$FILE; \
-	done
-	if command -v doxygen; then \
-		doxygen Doxyfile.help ; \
-		for i in $(HELP_SRC); do \
-			CMD_NAME=`basename $$i .txt`; \
-			sed -e "s/\(.\)\\.SH/\1/" -e "s/$$CMD_NAME *\\\\- *\"\(.*\)\"/\1/" <help_doc/man/man1/$$CMD_NAME.1 >share/man/$$CMD_NAME.1; \
-		done \
-	fi
-	rm doc_src/*.doxygen   # Clean up intermediate files in doc_src/
-	rm -rf help_doc         # Clean up intermediate help_doc tree
+	-rm -Rf share/man/man1
+	./build_tools/build_documentation.sh Doxyfile.help ./doc_src ./share
 
 #
 # The build rules for installing/uninstalling fish
@@ -541,6 +509,20 @@ check-uninstall:
 	fi;
 .PHONY: check-uninstall
 
+check-legacy-binaries:
+	@SEQLOC=$(prefix)/bin/seq;\
+	if test -f "$$SEQLOC" && grep -q '\(^#!/.*/fish\|^#!/usr/bin/env fish\)' "$$SEQLOC"; then\
+		echo "An outdated seq from a previous fish install was found. You should remove it with:";\
+		echo "    rm '$$SEQLOC'";\
+	fi;
+	@SETCOLOR_LOC=$(prefix)/bin/set_color;\
+	if test -x "$$SETCOLOR_LOC" && $$SETCOLOR_LOC -v 2>&1 >/dev/null | grep -q "^set_color, version "; then\
+		echo "An outdated set_color from a previous fish install was found. You should remove it with:";\
+		echo "    rm '$$SETCOLOR_LOC'";\
+	fi;
+	@true;
+.PHONY: check-legacy-binaries
+
 
 #
 # This check makes sure that the install-sh script is executable. The
@@ -557,7 +539,7 @@ install-sh:
 # Try to install after checking for incompatible installed versions.
 #
 
-install: all install-sh check-uninstall install-force
+install: all install-sh check-uninstall install-force check-legacy-binaries
 .PHONY: install
 
 #
@@ -599,7 +581,7 @@ install-force: all install-translations
 		$(INSTALL) -m 644 $$i $(DESTDIR)$(datadir)/fish/functions/; \
 		true; \
 	done;
-	for i in share/man/*.1; do \
+	for i in share/man/man1/*.1; do \
 		$(INSTALL) -m 644 $$i $(DESTDIR)$(datadir)/fish/man/man1/; \
 		true; \
 	done;
@@ -654,7 +636,6 @@ uninstall: uninstall-translations
 	-for i in $(PROGRAMS); do \
 		rm -f $(DESTDIR)$(bindir)/$$i; \
 	done;
-	-rm -f $(DESTDIR)$(bindir)/xsel
 	-rm -rf $(DESTDIR)$(sysconfdir)/fish
 	-if test -d $(DESTDIR)$(datadir)/fish; then \
 		rm -r $(DESTDIR)$(datadir)/fish; \
@@ -760,14 +741,6 @@ mimedb: $(MIME_OBJS)
 
 
 #
-# Build the set_color program
-#
-
-set_color: set_color.o print_help.o common.o color.o wutil.o
-	$(CXX) set_color.o print_help.o common.o wutil.o color.o $(LDFLAGS_SET_COLOR) -o $@
-
-
-#
 # Build the fish_indent program.
 #
 
@@ -842,9 +815,8 @@ rpm: fish-@PACKAGE_VERSION@.tar.bz2 fish.spec
 #
 
 distclean: clean
-	rm -f fish.spec Doxyfile.help
+	rm -f fish.spec
 	rm -f config.status config.log config.h Makefile
-	rm -rf $(XSEL)
 .PHONY: distclean
 
 
@@ -872,7 +844,6 @@ clean:
 	fi
 	rm -rf fish-@PACKAGE_VERSION@
 	rm -f $(TRANSLATIONS)
-	test ! -d "$(XSEL)" || make -C $(XSEL) clean
 .PHONY: clean
 
 
@@ -886,7 +857,7 @@ builtin.o: wgetopt.h sanity.h tokenizer.h wildcard.h expand.h input_common.h
 builtin.o: input.h intern.h exec.h highlight.h screen.h color.h parse_util.h
 builtin.o: autoload.h lru.h parser_keywords.h path.h history.h
 builtin.o: builtin_set.cpp builtin_commandline.cpp builtin_complete.cpp
-builtin.o: builtin_ulimit.cpp builtin_jobs.cpp
+builtin.o: builtin_ulimit.cpp builtin_jobs.cpp builtin_printf.cpp
 builtin_commandline.o: config.h signal.h fallback.h util.h wutil.h common.h
 builtin_commandline.o: builtin.h io.h wgetopt.h reader.h complete.h proc.h
 builtin_commandline.o: parser.h event.h function.h tokenizer.h input_common.h
@@ -903,6 +874,7 @@ builtin_test.o: config.h common.h util.h builtin.h io.h wutil.h proc.h
 builtin_test.o: signal.h
 builtin_ulimit.o: config.h fallback.h signal.h util.h builtin.h io.h common.h
 builtin_ulimit.o: wgetopt.h
+builtin_printf.o: wgetopt.h
 color.o: color.h config.h common.h util.h fallback.h signal.h
 common.o: config.h fallback.h signal.h util.h wutil.h common.h expand.h
 common.o: proc.h io.h wildcard.h parser.h event.h function.h complete.h
@@ -996,8 +968,6 @@ sanity.o: config.h signal.h fallback.h util.h common.h sanity.h proc.h io.h
 sanity.o: history.h wutil.h reader.h complete.h kill.h
 screen.o: config.h fallback.h signal.h common.h util.h wutil.h output.h
 screen.o: screen.h color.h highlight.h env.h
-set_color.o: config.h fallback.h signal.h print_help.h color.h common.h
-set_color.o: util.h
 signal.o: config.h signal.h common.h util.h fallback.h wutil.h event.h
 signal.o: reader.h io.h complete.h proc.h
 tokenizer.o: config.h fallback.h signal.h util.h wutil.h common.h tokenizer.h

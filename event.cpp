@@ -19,6 +19,7 @@
 
 #include "wutil.h"
 #include "function.h"
+#include "input_common.h"
 #include "proc.h"
 #include "parser.h"
 #include "common.h"
@@ -40,15 +41,15 @@ typedef struct
     /**
        Number of delivered signals
     */
-    int count;
+    volatile int count;
     /**
        Whether signals have been skipped
     */
-    int overflow;
+    volatile int overflow;
     /**
        Array of signal events
     */
-    int signal[SIG_UNHANDLED_MAX];
+    volatile int signal[SIG_UNHANDLED_MAX];
 }
 signal_list_t;
 
@@ -62,7 +63,7 @@ static signal_list_t sig_list[]= {{0,0},{0,0}};
 /**
    The index of sig_list that is the list of signals currently written to
 */
-static int active_list=0;
+static volatile int active_list=0;
 
 typedef std::vector<event_t *> event_list_t;
 
@@ -441,6 +442,16 @@ static int event_is_killed(const event_t &e)
     return std::find(killme.begin(), killme.end(), &e) != killme.end();
 }
 
+/* Callback for firing (and then deleting) an event */
+static void fire_event_callback(void *arg)
+{
+    ASSERT_IS_MAIN_THREAD();
+    assert(arg != NULL);
+    event_t *event = static_cast<event_t *>(arg);
+    event_fire(event);
+    delete event;
+}
+
 /**
    Perform the specified event. Since almost all event firings will
    not be matched by even a single event handler, we make sure to
@@ -487,6 +498,14 @@ static void event_fire_internal(const event_t &event)
     */
     if (fire.empty())
         return;
+
+    if (signal_is_blocked())
+    {
+        /* Fix for https://github.com/fish-shell/fish-shell/issues/608. Don't run event handlers while signals are blocked. */
+        event_t *heap_event = new event_t(event);
+        input_common_add_callback(fire_event_callback, heap_event);
+        return;
+    }
 
     /*
       Iterate over our list of matching events
@@ -576,23 +595,26 @@ static void event_fire_delayed()
         blocked.swap(new_blocked);
     }
 
-    while (sig_list[active_list].count > 0)
+    int al = active_list;
+
+    while (sig_list[al].count > 0)
     {
         signal_list_t *lst;
 
         /*
           Switch signal lists
         */
-        sig_list[1-active_list].count=0;
-        sig_list[1-active_list].overflow=0;
-        active_list=1-active_list;
+        sig_list[1-al].count=0;
+        sig_list[1-al].overflow=0;
+        al = 1-al;
+        active_list=al;
 
         /*
           Set up
         */
+        lst = &sig_list[1-al];
         event_t e = event_t::signal_event(0);
         e.arguments.resize(1);
-        lst = &sig_list[1-active_list];
 
         if (lst->overflow)
         {
@@ -634,10 +656,10 @@ void event_fire_signal(int signal)
 }
 
 
-void event_fire(event_t *event)
+void event_fire(const event_t *event)
 {
 
-    if (event && (event->type == EVENT_SIGNAL))
+    if (event && event->type == EVENT_SIGNAL)
     {
         event_fire_signal(event->param1.signal);
     }
@@ -695,6 +717,14 @@ void event_fire_generic(const wchar_t *name, wcstring_list_t *args)
     if (args)
         ev.arguments = *args;
     event_fire(&ev);
+}
+
+event_t::event_t(int t) : type(t), param1(), str_param1(), function_name(), arguments()
+{
+}
+
+event_t::~event_t()
+{
 }
 
 event_t event_t::signal_event(int sig)

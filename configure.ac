@@ -11,10 +11,6 @@
 
 AC_INIT(fish,2.0.0,fish-users@lists.sf.net)
 
-#
-# preserve configure arguments for xsel
-#
-
 conf_arg=$@
 
 #
@@ -29,16 +25,9 @@ AC_SUBST(LIBS_FISH_INDENT)
 AC_SUBST(LIBS_FISH_PAGER)
 AC_SUBST(LIBS_FISHD)
 AC_SUBST(LIBS_MIMEDB)
-AC_SUBST(LIBS_SET_COLOR)
 AC_SUBST(localedir)
 AC_SUBST(optbindirs)
 AC_SUBST(prefix)
-AC_SUBST(SEQ_FALLBACK)
-AC_SUBST(XSEL)
-AC_SUBST(XSEL_MAN)
-AC_SUBST(XSEL_BIN)
-AC_SUBST(XSEL_MAN_PATH)
-
 
 
 #
@@ -166,59 +155,6 @@ AC_PROG_CXX([g++ c++])
 AC_PROG_CPP
 AC_PROG_INSTALL
 
-#
-# Check for seq command. If missing, make sure fallback shellscript
-# implementation is installed.
-#
-
-AC_CHECK_PROG( SEQ_FALLBACK, seq, [ ], [seq])
-
-
-if test "$SEQ_FALLBACK"; then
-
-  #
-  # We already have seq. Check if the seq version is installed by an
-  # earlier fish version. If it is, we'll replace it.
-  #
-
-  file=`which seq`
-  if test -f "$file"; then
-
-    AC_MSG_CHECKING([if seq comes from a previous fish version])
-    shebang=`grep "\(^#!/.*/fish\|^#!/usr/bin/env fish\)" $file`
-
-    if test "$shebang"; then
-      SEQ_FALLBACK=seq
-      AC_MSG_RESULT(yes, replace it)
-    else
-      AC_MSG_RESULT(no, keep it)
-    fi
-  fi
-fi
-
-
-#
-# Optionally drop xsel command
-#
-
-AC_ARG_WITH(
-  xsel,
-  AC_HELP_STRING(
-    [--without-xsel],
-    [do not build the xsel program needed for X clipboard integration.
-     If build xsel, it will be configured with the same options as fish.]
-  ),
-  [xsel=$withval],
-  [xsel=with_xsel]
-)
-
-if [[ "$xsel" = "with_xsel" ]]; then
-  XSEL=xsel-1.2.0
-  XSEL_BIN=$XSEL/xsel
-  XSEL_MAN=xsel.1x
-  XSEL_MAN_PATH=$XSEL/xsel.1x
-fi
-
 
 #
 # Optionally drop gettext support
@@ -226,18 +162,25 @@ fi
 
 AC_ARG_WITH(
   gettext,
-  AC_HELP_STRING(
+  AS_HELP_STRING(
     [--without-gettext],
     [do not translate messages, even if gettext is available]
   ),
   [local_gettext=$withval],
-  [local_gettext=yes]
+  [local_gettext=check]
 )
 
-if test x$local_gettext != xno; then
-  AC_DEFINE([USE_GETTEXT],[1],[Perform string translations with gettext])
-fi
-
+AS_IF([test x$local_gettext != xno],
+  [ AC_CHECK_PROGS( [found_msgfmt], [msgfmt], [no] )
+    if test x$found_msgfmt != xno; then
+      AC_DEFINE([USE_GETTEXT],[1],[Perform string translations with gettext])
+    elif test "x$local_gettext" != "xcheck" ; then
+      AC_MSG_FAILURE([--with-gettext was given, but the msgfmt program could not be found])
+    else
+      local_gettext=no
+    fi
+   ],
+)
 
 #
 # Try to enable large file support. This will make sure that on systems
@@ -264,7 +207,18 @@ if test "$GCC" = yes; then
   # bug has been verified to not exist on Linux using GCC 3.3.3.
   #
 
-  CXXFLAGS="$CXXFLAGS -fno-optimize-sibling-calls"
+  GCC_VERSION=$($CC -dumpversion)
+  GCC_VERSION_MAJOR=$(echo $GCC_VERSION | cut -d'.' -f1)
+  GCC_VERSION_MINOR=$(echo $GCC_VERSION | cut -d'.' -f2)
+  GCC_VERSION_PATCH=$(echo $GCC_VERSION | cut -d'.' -f3)
+
+  if test "$GCC_VERSION_MAJOR" -le 3; then
+    if test 0"$GCC_VERSION_MINOR" -le 3; then
+      if test 0"$GCC_VERSION_PATCH" -le 3; then
+        CXXFLAGS="$CXXFLAGS -fno-optimize-sibling-calls"
+      fi
+    fi
+  fi
 
 
   #
@@ -548,22 +502,14 @@ LIBS=$LIBS_COMMON
 
 
 #
-# Check for libraries needed by set_color
-#
-
-LIBS_COMMON=$LIBS
-LIBS="$LIBS_SHARED"
-if test x$local_gettext != xno; then
-  AC_SEARCH_LIBS( gettext, intl,,)
-fi
-LIBS_SET_COLOR=$LIBS
-LIBS=$LIBS_COMMON
-
-#
 # Check presense of various header files
 #
 
-AC_CHECK_HEADERS([getopt.h termio.h sys/resource.h term.h ncurses/term.h ncurses.h curses.h stropts.h siginfo.h sys/select.h sys/ioctl.h sys/termios.h libintl.h execinfo.h spawn.h])
+AC_CHECK_HEADERS([getopt.h termios.h sys/resource.h term.h ncurses/term.h ncurses.h curses.h stropts.h siginfo.h sys/select.h sys/ioctl.h execinfo.h spawn.h])
+
+if test x$local_gettext != xno; then
+  AC_CHECK_HEADERS([libintl.h])
+fi
 
 AC_CHECK_HEADER(
   [regex.h],
@@ -609,7 +555,7 @@ AC_CHECK_HEADER(
 
 XCFLAGS="$CXXFLAGS"
 
-echo Checking how to use -D_XOPEN_SOURCE=600 and -D_POSIX_C_SOURCE=200112L...
+echo checking how to use -D_XOPEN_SOURCE=600 and -D_POSIX_C_SOURCE=200112L...
 local_found_posix_switch=no
 
 for i in "" "-D_POSIX_C_SOURCE=200112L" "-D_XOPEN_SOURCE=600 -D_POSIX_C_SOURCE=200112L"; do
@@ -640,13 +586,6 @@ for i in "" "-D_POSIX_C_SOURCE=200112L" "-D_XOPEN_SOURCE=600 -D_POSIX_C_SOURCE=2
        * For: siginfo_t (also defined by signal.h when in
        * POSIX/extensions mode). */
       #include <siginfo.h>
-      #endif
-
-      #ifdef HAVE_SYS_TERMIOS_H
-      /* Neither POSIX, C89 nor C99: a common extension.
-       * For: TIOCGWINSZ and struct winsize (under at least
-       * Solaris, NetBSD and (dual-listed) FreeBSD). */
-      #include <sys/termios.h>
       #endif
 
       #ifdef HAVE_SYS_IOCTL_H
@@ -706,15 +645,16 @@ fi
 
 AC_CHECK_FUNCS( wcsdup wcsndup wcslen wcscasecmp wcsncasecmp fwprintf )
 AC_CHECK_FUNCS( futimes wcwidth wcswidth wcstok fputwc fgetwc )
-AC_CHECK_FUNCS( wcstol wcslcat wcslcpy lrand48_r killpg gettext )
-AC_CHECK_FUNCS( dcgettext backtrace backtrace_symbols sysconf )
+AC_CHECK_FUNCS( wcstol wcslcat wcslcpy lrand48_r killpg )
+AC_CHECK_FUNCS( backtrace backtrace_symbols sysconf getifaddrs )
+
+if test x$local_gettext != xno; then
+  AC_CHECK_FUNCS( gettext dcgettext )
 
 #
 # The Makefile also needs to know if we have gettext, so it knows if
 # the translations should be installed.
 #
-
-if test x$local_gettext != xno; then
   AC_CHECK_FUNC( gettext, HAVE_GETTEXT=1, HAVE_GETTEXT=0 )
 fi
 
@@ -771,8 +711,8 @@ AC_LINK_IFELSE(
   [
     AC_LANG_PROGRAM(
       [
-        #ifdef HAVE_SYS_TERMIOS_H
-        #include <sys/termios.h>
+        #ifdef HAVE_TERMIOS_H
+        #include <termios.h>
         #endif
 
         #ifdef HAVE_SYS_IOCTL_H
@@ -937,7 +877,7 @@ case $target_os in
 esac
 
 # Tell the world what we know
-AC_CONFIG_FILES([Makefile fish.spec Doxyfile.help seq])
+AC_CONFIG_FILES([Makefile fish.spec])
 AC_OUTPUT
 
 if test ! x$local_found_posix_switch = xyes; then
@@ -945,12 +885,6 @@ if test ! x$local_found_posix_switch = xyes; then
   echo "Some fish features may be disabled."
 fi
 
-if [[ "$xsel" = "with_xsel" ]]; then
-  echo "Now configure xsel with $conf_arg"
-  rm -rf $XSEL
-  tar xf $XSEL.tar.gz
-  cd $XSEL && ./configure $conf_arg
-fi
 echo "fish is now configured."
 echo "Use 'make' and 'make install' to build and install fish."
 

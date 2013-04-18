@@ -264,11 +264,9 @@ int wstat(const wcstring &file_name, struct stat *buf)
 
 int lwstat(const wcstring &file_name, struct stat *buf)
 {
-    // fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
     cstring tmp = wcs2string(file_name);
     return lstat(tmp.c_str(), buf);
 }
-
 
 int waccess(const wcstring &file_name, int mode)
 {
@@ -290,6 +288,78 @@ void wperror(const wcstring &s)
         fwprintf(stderr, L"%ls: ", s.c_str());
     }
     fwprintf(stderr, L"%s\n", strerror(e));
+}
+
+int make_fd_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    int err = 0;
+    if (! (flags & O_NONBLOCK))
+    {
+        err = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    return err == -1 ? errno : 0;
+}
+
+int make_fd_blocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    int err = 0;
+    if (flags & O_NONBLOCK)
+    {
+        err = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+    return err == -1 ? errno : 0;
+}
+
+static inline void safe_append(char *buffer, const char *s, size_t buffsize)
+{
+    strncat(buffer, s, buffsize - strlen(buffer) - 1);
+}
+
+const char *safe_strerror(int err)
+{
+    if (err >= 0 && err < sys_nerr && sys_errlist[err] != NULL)
+    {
+        return sys_errlist[err];
+    }
+    else
+    {
+        int saved_err = errno;
+
+        /* Use a shared buffer for this case */
+        static char buff[384];
+        char errnum_buff[64];
+        format_long_safe(errnum_buff, err);
+
+        buff[0] = '\0';
+        safe_append(buff, "unknown error (errno was ", sizeof buff);
+        safe_append(buff, errnum_buff, sizeof buff);
+        safe_append(buff, ")", sizeof buff);
+
+        errno = saved_err;
+        return buff;
+    }
+}
+
+void safe_perror(const char *message)
+{
+    // Note we cannot use strerror, because on Linux it uses gettext, which is not safe
+    int err = errno;
+
+    char buff[384];
+    buff[0] = '\0';
+
+    if (message)
+    {
+        safe_append(buff, message, sizeof buff);
+        safe_append(buff, ": ", sizeof buff);
+    }
+    safe_append(buff, safe_strerror(err), sizeof buff);
+    safe_append(buff, "\n", sizeof buff);
+
+    write(STDERR_FILENO, buff, strlen(buff));
+    errno = err;
 }
 
 #ifdef HAVE_REALPATH_NULL
@@ -331,16 +401,15 @@ wchar_t *wrealpath(const wcstring &pathname, wchar_t *resolved_path)
     if (!narrow_res)
         return 0;
 
+    const wcstring wide_res = str2wcstring(narrow_res);
     if (resolved_path)
     {
-        wchar_t *tmp2 = str2wcs(narrow_res);
-        wcslcpy(resolved_path, tmp2, PATH_MAX);
-        free(tmp2);
+        wcslcpy(resolved_path, wide_res.c_str(), PATH_MAX);
         res = resolved_path;
     }
     else
     {
-        res = str2wcs(narrow_res);
+        res = wcsdup(wide_res.c_str());
     }
     return res;
 }
@@ -370,8 +439,8 @@ wcstring wbasename(const wcstring &path)
 static void wgettext_really_init()
 {
     pthread_mutex_init(&wgettext_lock, NULL);
-    bindtextdomain(PACKAGE_NAME, LOCALEDIR);
-    textdomain(PACKAGE_NAME);
+    fish_bindtextdomain(PACKAGE_NAME, LOCALEDIR);
+    fish_textdomain(PACKAGE_NAME);
 }
 
 /**
@@ -400,20 +469,11 @@ const wchar_t *wgettext(const wchar_t *in)
     if (val == NULL)
     {
         cstring mbs_in = wcs2string(key);
-        char *out = gettext(mbs_in.c_str());
+        char *out = fish_gettext(mbs_in.c_str());
         val = new wcstring(format_string(L"%s", out));
     }
     errno = err;
     return val->c_str();
-}
-
-wcstring wgettext2(const wcstring &in)
-{
-    wgettext_init_if_necessary();
-    std::string mbs_in = wcs2string(in);
-    char *out = gettext(mbs_in.c_str());
-    wcstring result = format_string(L"%s", out);
-    return result;
 }
 
 const wchar_t *wgetenv(const wcstring &name)

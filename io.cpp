@@ -15,10 +15,6 @@ Utilities for io redirection.
 #include <set>
 #include <algorithm>
 
-#ifdef HAVE_SYS_TERMIOS_H
-#include <sys/termios.h>
-#endif
-
 #ifdef HAVE_SYS_IOCTL_H
 #include <sys/ioctl.h>
 #endif
@@ -30,10 +26,6 @@ Utilities for io redirection.
 #include <ncurses.h>
 #else
 #include <curses.h>
-#endif
-
-#if HAVE_TERMIO_H
-#include <termio.h>
 #endif
 
 #if HAVE_TERM_H
@@ -51,23 +43,54 @@ Utilities for io redirection.
 #include "io.h"
 
 
-void io_buffer_read(io_data_t *d)
+io_data_t::~io_data_t()
 {
-    exec_close(d->param1.pipe_fd[1]);
+}
 
-    if (d->io_mode == IO_BUFFER)
+void io_close_t::print() const
+{
+    fprintf(stderr, "close %d\n", fd);
+}
+
+void io_fd_t::print() const
+{
+    fprintf(stderr, "FD map %d -> %d\n", old_fd, fd);
+}
+
+void io_file_t::print() const
+{
+    fprintf(stderr, "file (%s)\n", filename_cstr);
+}
+
+void io_pipe_t::print() const
+{
+    fprintf(stderr, "pipe {%d, %d} (input: %s)\n", pipe_fd[0], pipe_fd[1],
+            is_input ? "yes" : "no");
+}
+
+void io_buffer_t::print() const
+{
+    fprintf(stderr, "buffer %p (input: %s, size %lu)\n", out_buffer_ptr(),
+            is_input ? "yes" : "no", out_buffer_size());
+}
+
+void io_buffer_t::read()
+{
+    exec_close(pipe_fd[1]);
+
+    if (io_mode == IO_BUFFER)
     {
-        /*    if( fcntl( d->param1.pipe_fd[0], F_SETFL, 0 ) )
+        /*    if( fcntl( pipe_fd[0], F_SETFL, 0 ) )
             {
               wperror( L"fcntl" );
               return;
               }  */
-        debug(4, L"io_buffer_read: blocking read on fd %d", d->param1.pipe_fd[0]);
+        debug(4, L"io_buffer_t::read: blocking read on fd %d", pipe_fd[0]);
         while (1)
         {
             char b[4096];
             long l;
-            l=read_blocked(d->param1.pipe_fd[0], b, 4096);
+            l=read_blocked(pipe_fd[0], b, 4096);
             if (l==0)
             {
                 break;
@@ -85,39 +108,37 @@ void io_buffer_read(io_data_t *d)
                 {
                     debug(1,
                           _(L"An error occured while reading output from code block on file descriptor %d"),
-                          d->param1.pipe_fd[0]);
-                    wperror(L"io_buffer_read");
+                          pipe_fd[0]);
+                    wperror(L"io_buffer_t::read");
                 }
 
                 break;
             }
             else
             {
-                d->out_buffer_append(b, l);
+                out_buffer_append(b, l);
             }
         }
     }
 }
 
 
-io_data_t *io_buffer_create(bool is_input)
+io_buffer_t *io_buffer_t::create(bool is_input, int fd)
 {
     bool success = true;
-    io_data_t *buffer_redirect = new io_data_t;
-    buffer_redirect->out_buffer_create();
-    buffer_redirect->io_mode = IO_BUFFER;
-    buffer_redirect->is_input = is_input ? true : false;
-    buffer_redirect->fd=is_input?0:1;
+    if (fd == -1)
+    {
+        fd = is_input ? 0 : 1;
+    }
+    io_buffer_t *buffer_redirect = new io_buffer_t(fd, is_input);
 
-    if (exec_pipe(buffer_redirect->param1.pipe_fd) == -1)
+    if (exec_pipe(buffer_redirect->pipe_fd) == -1)
     {
         debug(1, PIPE_ERROR);
         wperror(L"pipe");
         success = false;
     }
-    else if (fcntl(buffer_redirect->param1.pipe_fd[0],
-                   F_SETFL,
-                   O_NONBLOCK))
+    else if (make_fd_nonblocking(buffer_redirect->pipe_fd[0]) != 0)
     {
         debug(1, PIPE_ERROR);
         wperror(L"fcntl");
@@ -129,32 +150,39 @@ io_data_t *io_buffer_create(bool is_input)
         delete buffer_redirect;
         buffer_redirect = NULL;
     }
+    else
+    {
+        //fprintf(stderr, "Created pipes {%d, %d} for %p\n", buffer_redirect->pipe_fd[0], buffer_redirect->pipe_fd[1], buffer_redirect);
+    }
 
     return buffer_redirect;
 }
 
-void io_buffer_destroy(io_data_t *io_buffer)
+io_buffer_t::~io_buffer_t()
 {
 
+    //fprintf(stderr, "Deallocating pipes {%d, %d} for %p\n", this->pipe_fd[0], this->pipe_fd[1], this);
     /**
        If this is an input buffer, then io_read_buffer will not have
        been called, and we need to close the output fd as well.
     */
-    if (io_buffer->is_input)
+    if (is_input && pipe_fd[1] >= 0)
     {
-        exec_close(io_buffer->param1.pipe_fd[1]);
+        exec_close(pipe_fd[1]);
     }
 
-    exec_close(io_buffer->param1.pipe_fd[0]);
+    if (pipe_fd[0] >= 0)
+    {
+        exec_close(pipe_fd[0]);
+    }
 
     /*
       Dont free fd for writing. This should already be free'd before
       calling exec_read_io_buffer on the buffer
     */
-    delete io_buffer;
 }
 
-void io_chain_t::remove(const io_data_t *element)
+void io_chain_t::remove(const shared_ptr<const io_data_t> &element)
 {
     // See if you can guess why std::find doesn't work here
     for (io_chain_t::iterator iter = this->begin(); iter != this->end(); ++iter)
@@ -167,46 +195,16 @@ void io_chain_t::remove(const io_data_t *element)
     }
 }
 
-io_chain_t io_chain_t::duplicate() const
+void io_chain_t::push_back(const shared_ptr<io_data_t> &element)
 {
-    io_chain_t result;
-    result.reserve(this->size());
-    for (io_chain_t::const_iterator iter = this->begin(); iter != this->end(); iter++)
-    {
-        const io_data_t *io = *iter;
-        result.push_back(new io_data_t(*io));
-    }
-    return result;
+    // Ensure we never push back NULL
+    assert(element.get() != NULL);
+    std::vector<shared_ptr<io_data_t> >::push_back(element);
 }
 
-void io_chain_t::duplicate_prepend(const io_chain_t &src)
-{
-    /* Prepend a duplicate of src before this. Start by inserting a bunch of NULLs (so we only have to reallocate once) and then replace them. */
-    this->insert(this->begin(), src.size(), NULL);
-    for (size_t idx = 0; idx < src.size(); idx++)
-    {
-        const io_data_t *src_data = src.at(idx);
-        this->at(idx) = new io_data_t(*src_data);
-    }
-}
-
-void io_chain_t::destroy()
-{
-    for (size_t idx = 0; idx < this->size(); idx++)
-    {
-        delete this->at(idx);
-    }
-    this->clear();
-}
-
-void io_remove(io_chain_t &list, const io_data_t *element)
+void io_remove(io_chain_t &list, const shared_ptr<const io_data_t> &element)
 {
     list.remove(element);
-}
-
-io_chain_t io_duplicate(const io_chain_t &chain)
-{
-    return chain.duplicate();
 }
 
 void io_print(const io_chain_t &chain)
@@ -220,84 +218,65 @@ void io_print(const io_chain_t &chain)
     fprintf(stderr, "Chain %p (%ld items):\n", &chain, (long)chain.size());
     for (size_t i=0; i < chain.size(); i++)
     {
-        const io_data_t *io = chain.at(i);
-        fprintf(stderr, "\t%lu: fd:%d, input:%s, ", (unsigned long)i, io->fd, io->is_input ? "yes" : "no");
-        switch (io->io_mode)
+        const shared_ptr<const io_data_t> &io = chain.at(i);
+        if (io.get() == NULL)
         {
-            case IO_FILE:
-                fprintf(stderr, "file (%s)\n", io->filename_cstr);
-                break;
-            case IO_PIPE:
-                fprintf(stderr, "pipe {%d, %d}\n", io->param1.pipe_fd[0], io->param1.pipe_fd[1]);
-                break;
-            case IO_FD:
-                fprintf(stderr, "FD map %d -> %d\n", io->param1.old_fd, io->fd);
-                break;
-            case IO_BUFFER:
-                fprintf(stderr, "buffer %p (size %lu)\n", io->out_buffer_ptr(), io->out_buffer_size());
-                break;
-            case IO_CLOSE:
-                fprintf(stderr, "close %d\n", io->fd);
-                break;
+            fprintf(stderr, "\t(null)\n");
+        }
+        else
+        {
+            fprintf(stderr, "\t%lu: fd:%d, ", (unsigned long)i, io->fd);
+            io->print();
         }
     }
-}
-
-void io_duplicate_prepend(const io_chain_t &src, io_chain_t &dst)
-{
-    return dst.duplicate_prepend(src);
-}
-
-void io_chain_destroy(io_chain_t &chain)
-{
-    chain.destroy();
 }
 
 /* Return the last IO for the given fd */
-const io_data_t *io_chain_t::get_io_for_fd(int fd) const
+shared_ptr<const io_data_t> io_chain_t::get_io_for_fd(int fd) const
 {
     size_t idx = this->size();
     while (idx--)
     {
-        const io_data_t *data = this->at(idx);
+        const shared_ptr<const io_data_t> &data = this->at(idx);
         if (data->fd == fd)
         {
             return data;
         }
     }
-    return NULL;
+    return shared_ptr<const io_data_t>();
 }
 
-io_data_t *io_chain_t::get_io_for_fd(int fd)
+shared_ptr<io_data_t> io_chain_t::get_io_for_fd(int fd)
 {
     size_t idx = this->size();
     while (idx--)
     {
-        io_data_t *data = this->at(idx);
+        const shared_ptr<io_data_t> &data = this->at(idx);
         if (data->fd == fd)
         {
             return data;
         }
     }
-    return NULL;
+    return shared_ptr<io_data_t>();
 }
 
 /* The old function returned the last match, so we mimic that. */
-const io_data_t *io_chain_get(const io_chain_t &src, int fd)
+shared_ptr<const io_data_t> io_chain_get(const io_chain_t &src, int fd)
 {
     return src.get_io_for_fd(fd);
 }
 
-io_data_t *io_chain_get(io_chain_t &src, int fd)
+shared_ptr<io_data_t> io_chain_get(io_chain_t &src, int fd)
 {
     return src.get_io_for_fd(fd);
 }
 
-io_chain_t::io_chain_t(io_data_t *data) : std::vector<io_data_t *>(1, data)
+io_chain_t::io_chain_t(const shared_ptr<io_data_t> &data) :
+    std::vector<shared_ptr<io_data_t> >(1, data)
 {
 
 }
 
-io_chain_t::io_chain_t() : std::vector<io_data_t *>()
+io_chain_t::io_chain_t() : std::vector<shared_ptr<io_data_t> >()
 {
 }

@@ -177,6 +177,8 @@ public:
     { }
 
     expression *parse_expression(unsigned int start, unsigned int end);
+    expression *parse_3_arg_expression(unsigned int start, unsigned int end);
+    expression *parse_4_arg_expression(unsigned int start, unsigned int end);
     expression *parse_combining_expression(unsigned int start, unsigned int end);
     expression *parse_unary_expression(unsigned int start, unsigned int end);
 
@@ -334,17 +336,19 @@ expression *test_parser::parse_combining_expression(unsigned int start, unsigned
     std::vector<expression *> subjects;
     std::vector<token_t> combiners;
     unsigned int idx = start;
+    bool first = true;
 
     while (idx < end)
     {
 
-        if (! subjects.empty())
+        if (! first)
         {
             /* This is not the first expression, so we expect a combiner. */
             token_t combiner = token_for_string(arg(idx))->tok;
             if (combiner != test_combine_and && combiner != test_combine_or)
             {
                 /* Not a combiner, we're done */
+                this->errors.insert(this->errors.begin(), format_string(L"Expected a combining operator like '-a' at index %u", idx));
                 break;
             }
             combiners.push_back(combiner);
@@ -356,12 +360,18 @@ expression *test_parser::parse_combining_expression(unsigned int start, unsigned
         if (! expr)
         {
             add_error(L"Missing argument at index %u", idx);
+            if (! first)
+            {
+                /* Clean up the dangling combiner, since it never got its right hand expression */
+                combiners.pop_back();
+            }
             break;
         }
 
         /* Go to the end of this expression */
         idx = expr->range.end;
         subjects.push_back(expr);
+        first = false;
     }
 
     if (! subjects.empty())
@@ -531,6 +541,64 @@ expression *test_parser::parse_primary(unsigned int start, unsigned int end)
     return expr;
 }
 
+// See IEEE 1003.1 breakdown of the behavior for different parameter counts
+expression *test_parser::parse_3_arg_expression(unsigned int start, unsigned int end)
+{
+    assert(end - start == 3);
+    expression *result = NULL;
+
+    const token_info_t *center_token = token_for_string(arg(start + 1));
+    if (center_token->flags & BINARY_PRIMARY)
+    {
+        result = parse_binary_primary(start, end);
+    }
+    else if (center_token->tok == test_combine_and || center_token->tok == test_combine_or)
+    {
+        expr_ref_t left(parse_unary_expression(start, start + 1));
+        expr_ref_t right(parse_unary_expression(start + 2, start + 3));
+        if (left.get() && right.get())
+        {
+            // Transfer ownership to the vector of subjects
+            std::vector<token_t> combiners(1, center_token->tok);
+            std::vector<expression *> subjects;
+            subjects.push_back(left.release());
+            subjects.push_back(right.release());
+            result = new combining_expression(center_token->tok, range_t(start, end), subjects, combiners);
+        }
+    }
+    else
+    {
+        result = parse_unary_expression(start, end);
+    }
+    return result;
+}
+
+expression *test_parser::parse_4_arg_expression(unsigned int start, unsigned int end)
+{
+    assert(end - start == 4);
+    expression *result = NULL;
+
+    token_t first_token = token_for_string(arg(start))->tok;
+    if (first_token == test_bang)
+    {
+        expr_ref_t subject(parse_3_arg_expression(start + 1, end));
+        if (subject.get())
+        {
+            result = new unary_operator(first_token, range_t(start, subject->range.end), subject);
+        }
+    }
+    else if (first_token == test_paren_open)
+    {
+        result = parse_parenthentical(start, end);
+    }
+    else
+    {
+        result = parse_combining_expression(start, end);
+    }
+    return result;
+}
+
+
 expression *test_parser::parse_expression(unsigned int start, unsigned int end)
 {
     if (start >= end)
@@ -538,7 +606,37 @@ expression *test_parser::parse_expression(unsigned int start, unsigned int end)
         return error(L"Missing argument at index %u", start);
     }
 
-    return parse_combining_expression(start, end);
+    unsigned int argc = end - start;
+    switch (argc)
+    {
+        case 0:
+            assert(0); //should have been caught by the above test
+            return NULL;
+
+        case 1:
+        {
+            return error(L"Missing argument at index %u", start + 1);
+        }
+        case 2:
+        {
+            return parse_unary_expression(start, end);
+        }
+
+        case 3:
+        {
+            return parse_3_arg_expression(start, end);
+        }
+
+        case 4:
+        {
+            return parse_4_arg_expression(start, end);
+        }
+
+        default:
+        {
+            return parse_combining_expression(start, end);
+        }
+    }
 }
 
 expression *test_parser::parse_args(const wcstring_list_t &args, wcstring &err)
@@ -561,16 +659,20 @@ expression *test_parser::parse_args(const wcstring_list_t &args, wcstring &err)
         break;
     }
 
-    if (! errored && result)
+    if (result)
     {
         /* It's also an error if there are any unused arguments. This is not detected by parse_expression() */
         assert(result->range.end <= args.size());
         if (result->range.end < args.size())
         {
-            append_format(err, L"test: unexpected argument at index %lu: '%ls'\n", (unsigned long)result->range.end, args.at(result->range.end).c_str());
+            if (err.empty())
+            {
+                append_format(err, L"test: unexpected argument at index %lu: '%ls'\n", (unsigned long)result->range.end, args.at(result->range.end).c_str());
+            }
+            errored = true;
+
             delete result;
             result = NULL;
-            errored = true;
         }
     }
 
@@ -791,53 +893,77 @@ int builtin_test(parser_t &parser, wchar_t **argv)
     if (! argv[0])
         return BUILTIN_TEST_FAIL;
 
+    /* Whether we are invoked with bracket '[' or not */
+    const bool is_bracket = ! wcscmp(argv[0], L"[");
+
     size_t argc = 0;
     while (argv[argc + 1])
         argc++;
-    const wcstring_list_t args(argv + 1, argv + 1 + argc);
 
-    if (argc == 0)
+    /* If we're bracket, the last argument ought to be ]; we ignore it. Note that argc is the number of arguments after the command name; thus argv[argc] is the last argument. */
+    if (is_bracket)
     {
-        // Per 1003.1, exit false
-        return BUILTIN_TEST_FAIL;
-    }
-    else if (argc == 1)
-    {
-        // Per 1003.1, exit true if the arg is non-empty
-        return args.at(0).empty() ? BUILTIN_TEST_FAIL : BUILTIN_TEST_SUCCESS;
-    }
-    else
-    {
-        // Try parsing. If expr is not nil, we are responsible for deleting it.
-        wcstring err;
-        expression *expr = test_parser::parse_args(args, err);
-        if (! expr)
+        if (! wcscmp(argv[argc], L"]"))
         {
-#if 0
-            printf("Oops! test was given args:\n");
-            for (size_t i=0; i < argc; i++)
-            {
-                printf("\t%ls\n", args.at(i).c_str());
-            }
-            printf("and returned parse error: %ls\n", err.c_str());
-#endif
-            builtin_show_error(err);
-            return BUILTIN_TEST_FAIL;
+            /* Ignore the closing bracketp */
+            argc--;
         }
         else
         {
-            wcstring_list_t eval_errors;
-            bool result = expr->evaluate(eval_errors);
-            if (! eval_errors.empty())
+            builtin_show_error(L"[: the last argument must be ']'\n");
+            return BUILTIN_TEST_FAIL;
+        }
+
+    }
+
+    /* Collect the arguments into a list */
+    const wcstring_list_t args(argv + 1, argv + 1 + argc);
+
+    switch (argc)
+    {
+        case 0:
+        {
+            // Per 1003.1, exit false
+            return BUILTIN_TEST_FAIL;
+        }
+        case 1:
+        {
+            // Per 1003.1, exit true if the arg is non-empty
+            return args.at(0).empty() ? BUILTIN_TEST_FAIL : BUILTIN_TEST_SUCCESS;
+        }
+        default:
+        {
+            // Try parsing. If expr is not nil, we are responsible for deleting it.
+            wcstring err;
+            expression *expr = test_parser::parse_args(args, err);
+            if (! expr)
             {
-                printf("test returned eval errors:\n");
-                for (size_t i=0; i < eval_errors.size(); i++)
+#if 0
+                printf("Oops! test was given args:\n");
+                for (size_t i=0; i < argc; i++)
                 {
-                    printf("\t%ls\n", eval_errors.at(i).c_str());
+                    printf("\t%ls\n", args.at(i).c_str());
                 }
+                printf("and returned parse error: %ls\n", err.c_str());
+#endif
+                builtin_show_error(err);
+                return BUILTIN_TEST_FAIL;
             }
-            delete expr;
-            return result ? BUILTIN_TEST_SUCCESS : BUILTIN_TEST_FAIL;
+            else
+            {
+                wcstring_list_t eval_errors;
+                bool result = expr->evaluate(eval_errors);
+                if (! eval_errors.empty())
+                {
+                    printf("test returned eval errors:\n");
+                    for (size_t i=0; i < eval_errors.size(); i++)
+                    {
+                        printf("\t%ls\n", eval_errors.at(i).c_str());
+                    }
+                }
+                delete expr;
+                return result ? BUILTIN_TEST_SUCCESS : BUILTIN_TEST_FAIL;
+            }
         }
     }
     return 1;

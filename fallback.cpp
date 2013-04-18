@@ -27,14 +27,14 @@
 #include <limits.h>
 #include <assert.h>
 
+#if HAVE_GETTEXT
+#include <libintl.h>
+#endif
+
 #if HAVE_NCURSES_H
 #include <ncurses.h>
 #else
 #include <curses.h>
-#endif
-
-#if HAVE_TERMIO_H
-#include <termio.h>
 #endif
 
 #if HAVE_TERM_H
@@ -276,6 +276,7 @@ static int vgwprintf(void (*writer)(wchar_t),
                 {
 
                     wchar_t *ss=0;
+                    wcstring wide_ss;
                     if (is_long)
                     {
                         ss = va_arg(va, wchar_t *);
@@ -286,7 +287,8 @@ static int vgwprintf(void (*writer)(wchar_t),
 
                         if (ns)
                         {
-                            ss = str2wcs(ns);
+                            wide_ss = str2wcstring(ns);
+                            ss = wide_ss.c_str();
                         }
                     }
 
@@ -318,9 +320,6 @@ static int vgwprintf(void (*writer)(wchar_t),
                         pad(writer, width-wcslen(ss));
                         count += maxi(width-wcslen(ss), 0);
                     }
-
-                    if (!is_long)
-                        free(ss);
 
                     break;
                 }
@@ -1127,30 +1126,52 @@ int futimes(int fd, const struct timeval *times)
 
 #endif
 
-#ifndef HAVE_GETTEXT
+#if HAVE_GETTEXT
 
-char * gettext(const char * msgid)
+char * fish_gettext(const char * msgid)
+{
+    return gettext(msgid);;
+}
+
+char * fish_bindtextdomain(const char * domainname, const char * dirname)
+{
+    return bindtextdomain(domainname, dirname);
+}
+
+char * fish_textdomain(const char * domainname)
+{
+    return textdomain(domainname);
+}
+
+#else
+
+char *fish_gettext(const char * msgid)
 {
     return (char *)msgid;
 }
 
-char * bindtextdomain(const char * domainname, const char * dirname)
+char *fish_bindtextdomain(const char * domainname, const char * dirname)
 {
-    return 0;
+    return NULL;
 }
 
-char * textdomain(const char * domainname)
+char *fish_textdomain(const char * domainname)
 {
-    return 0;
+    return NULL;
 }
 
 #endif
 
-#ifndef HAVE_DCGETTEXT
+#if HAVE_DCGETTEXT
 
-char * dcgettext(const char * domainname,
-                 const char * msgid,
-                 int category)
+char *fish_dcgettext(const char * domainname, const char * msgid, int category)
+{
+    return dcgettext(domainname, msgid, category);
+}
+
+#else
+
+char *fish_dcgettext(const char * domainname, const char * msgid, int category)
 {
     return (char *)msgid;
 }

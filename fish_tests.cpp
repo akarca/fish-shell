@@ -379,16 +379,20 @@ static void test_tok()
 static int test_fork_helper(void *unused)
 {
     size_t i;
-    for (i=0; i < 100000; i++)
+    for (i=0; i < 1000; i++)
     {
-        delete [](new char[4 * 1024 * 1024]);
+        //delete [](new char[4 * 1024 * 1024]);
+        for (int j=0; j < 1024; j++)
+        {
+            strerror(j);
+        }
     }
     return 0;
 }
 
 static void test_fork(void)
 {
-    return; // Test is disabled until I can force it to fail
+    return;
     say(L"Testing fork");
     size_t i, max = 100;
     for (i=0; i < 100; i++)
@@ -396,7 +400,7 @@ static void test_fork(void)
         printf("%lu / %lu\n", i+1, max);
         /* Do something horrible to try to trigger an error */
 #define THREAD_COUNT 8
-#define FORK_COUNT 200
+#define FORK_COUNT 10
 #define FORK_LOOP_COUNT 16
         signal_block();
         for (size_t i=0; i < THREAD_COUNT; i++)
@@ -417,7 +421,14 @@ static void test_fork(void)
                 else if (pid == 0)
                 {
                     /* Child */
-                    new char[4 * 1024 * 1024];
+                    //new char[4 * 1024 * 1024];
+                    for (size_t i=0; i < 1024 * 16; i++)
+                    {
+                        for (int j=0; j < 256; j++)
+                        {
+                            strerror(j);
+                        }
+                    }
                     exit_without_destructors(0);
                 }
                 else
@@ -452,52 +463,52 @@ static void test_parser()
     parser_t parser(PARSER_TYPE_GENERAL, true);
 
     say(L"Testing null input to parser");
-    if (!parser.test(0, 0, 0, 0))
+    if (!parser.test(NULL))
     {
         err(L"Null input to parser.test undetected");
     }
 
     say(L"Testing block nesting");
-    if (!parser.test(L"if; end", 0, 0, 0))
+    if (!parser.test(L"if; end"))
     {
         err(L"Incomplete if statement undetected");
     }
-    if (!parser.test(L"if test; echo", 0, 0, 0))
+    if (!parser.test(L"if test; echo"))
     {
         err(L"Missing end undetected");
     }
-    if (!parser.test(L"if test; end; end", 0, 0, 0))
+    if (!parser.test(L"if test; end; end"))
     {
         err(L"Unbalanced end undetected");
     }
 
     say(L"Testing detection of invalid use of builtin commands");
-    if (!parser.test(L"case foo", 0, 0, 0))
+    if (!parser.test(L"case foo"))
     {
         err(L"'case' command outside of block context undetected");
     }
-    if (!parser.test(L"switch ggg; if true; case foo;end;end", 0, 0, 0))
+    if (!parser.test(L"switch ggg; if true; case foo;end;end"))
     {
         err(L"'case' command outside of switch block context undetected");
     }
-    if (!parser.test(L"else", 0, 0, 0))
+    if (!parser.test(L"else"))
     {
         err(L"'else' command outside of conditional block context undetected");
     }
-    if (!parser.test(L"else if", 0, 0, 0))
+    if (!parser.test(L"else if"))
     {
         err(L"'else if' command outside of conditional block context undetected");
     }
-    if (!parser.test(L"if false; else if; end", 0, 0, 0))
+    if (!parser.test(L"if false; else if; end"))
     {
         err(L"'else if' missing command undetected");
     }
 
-    if (!parser.test(L"break", 0, 0, 0))
+    if (!parser.test(L"break"))
     {
         err(L"'break' command outside of loop block context undetected");
     }
-    if (!parser.test(L"exec ls|less", 0, 0, 0) || !parser.test(L"echo|return", 0, 0, 0))
+    if (!parser.test(L"exec ls|less") || !parser.test(L"echo|return"))
     {
         err(L"Invalid pipe command undetected");
     }
@@ -809,15 +820,20 @@ static void test_is_potential_path()
 
 /** Test the 'test' builtin */
 int builtin_test(parser_t &parser, wchar_t **argv);
-static bool run_test_test(int expected, wcstring_list_t &lst)
+static bool run_one_test_test(int expected, wcstring_list_t &lst, bool bracket)
 {
     parser_t parser(PARSER_TYPE_GENERAL, true);
     size_t i, count = lst.size();
-    wchar_t **argv = new wchar_t *[count+2];
-    argv[0] = (wchar_t *)L"test";
+    wchar_t **argv = new wchar_t *[count+3];
+    argv[0] = (wchar_t *)(bracket ? L"[" : L"test");
     for (i=0; i < count; i++)
     {
         argv[i+1] = (wchar_t *)lst.at(i).c_str();
+    }
+    if (bracket)
+    {
+        argv[i+1] = (wchar_t *)L"]";
+        i++;
     }
     argv[i+1] = NULL;
     int result = builtin_test(parser, argv);
@@ -834,12 +850,33 @@ static bool run_test_test(int expected, const wcstring &str)
     copy(istream_iterator<wcstring, wchar_t, std::char_traits<wchar_t> >(iss),
          istream_iterator<wstring, wchar_t, std::char_traits<wchar_t> >(),
          back_inserter<vector<wcstring> >(lst));
-    return run_test_test(expected, lst);
+
+    bool bracket = run_one_test_test(expected, lst, true);
+    bool nonbracket = run_one_test_test(expected, lst, false);
+    assert(bracket == nonbracket);
+    return nonbracket;
+}
+
+static void test_test_brackets()
+{
+    // Ensure [ knows it needs a ]
+    parser_t parser(PARSER_TYPE_GENERAL, true);
+
+    const wchar_t *argv1[] = {L"[", L"foo", NULL};
+    assert(builtin_test(parser, (wchar_t **)argv1) != 0);
+
+    const wchar_t *argv2[] = {L"[", L"foo", L"]", NULL};
+    assert(builtin_test(parser, (wchar_t **)argv2) == 0);
+
+    const wchar_t *argv3[] = {L"[", L"foo", L"]", L"bar", NULL};
+    assert(builtin_test(parser, (wchar_t **)argv3) != 0);
+
 }
 
 static void test_test()
 {
     say(L"Testing test builtin");
+    test_test_brackets();
 
     assert(run_test_test(0, L"5 -ne 6"));
     assert(run_test_test(0, L"5 -eq 5"));
@@ -892,6 +929,17 @@ static void test_test()
     /* We didn't properly handle multiple "just strings" either */
     assert(run_test_test(0, L"foo"));
     assert(run_test_test(0, L"foo -a bar"));
+
+    /* These should be errors */
+    assert(run_test_test(1, L"foo bar"));
+    assert(run_test_test(1, L"foo bar baz"));
+
+    /* This crashed */
+    assert(run_test_test(1, L"1 = 1 -a = 1"));
+
+    /* Make sure we can treat -S as a parameter instead of an operator. https://github.com/fish-shell/fish-shell/issues/601 */
+    assert(run_test_test(0, L"-S = -S"));
+    assert(run_test_test(1, L"! ! ! A"));
 }
 
 /** Testing colors */
@@ -909,6 +957,76 @@ static void test_colors()
     assert(rgb_color_t(L"magenta").is_named());
     assert(rgb_color_t(L"MaGeNTa").is_named());
     assert(rgb_color_t(L"mooganta").is_none());
+}
+
+static void test_complete(void)
+{
+    say(L"Testing complete");
+    const wchar_t *name_strs[] = {L"Foo1", L"Foo2", L"Foo3", L"Bar1", L"Bar2", L"Bar3"};
+    size_t count = sizeof name_strs / sizeof *name_strs;
+    const wcstring_list_t names(name_strs, name_strs + count);
+
+    complete_set_variable_names(&names);
+
+    std::vector<completion_t> completions;
+    complete(L"$F", completions, COMPLETION_REQUEST_DEFAULT);
+    assert(completions.size() == 3);
+    assert(completions.at(0).completion == L"oo1");
+    assert(completions.at(1).completion == L"oo2");
+    assert(completions.at(2).completion == L"oo3");
+
+    complete_set_variable_names(NULL);
+}
+
+static void test_1_completion(wcstring line, const wcstring &completion, complete_flags_t flags, bool append_only, wcstring expected, long source_line)
+{
+    // str is given with a caret, which we use to represent the cursor position
+    // find it
+    const size_t in_cursor_pos = line.find(L'^');
+    assert(in_cursor_pos != wcstring::npos);
+    line.erase(in_cursor_pos, 1);
+
+    const size_t out_cursor_pos = expected.find(L'^');
+    assert(out_cursor_pos != wcstring::npos);
+    expected.erase(out_cursor_pos, 1);
+
+    size_t cursor_pos = in_cursor_pos;
+    wcstring result = completion_apply_to_command_line(completion, flags, line, &cursor_pos, append_only);
+    if (result != expected)
+    {
+        fprintf(stderr, "line %ld: %ls + %ls -> [%ls], expected [%ls]\n", source_line, line.c_str(), completion.c_str(), result.c_str(), expected.c_str());
+    }
+    assert(result == expected);
+    assert(cursor_pos == out_cursor_pos);
+}
+
+static void test_completion_insertions()
+{
+#define TEST_1_COMPLETION(a, b, c, d, e) test_1_completion(a, b, c, d, e, __LINE__)
+    say(L"Testing completion insertions");
+    TEST_1_COMPLETION(L"foo^", L"bar", 0, false, L"foobar ^");
+    TEST_1_COMPLETION(L"foo^ baz", L"bar", 0, false, L"foobar ^ baz"); //we really do want to insert two spaces here - otherwise it's hidden by the cursor
+    TEST_1_COMPLETION(L"'foo^", L"bar", 0, false, L"'foobar' ^");
+    TEST_1_COMPLETION(L"'foo'^", L"bar", 0, false, L"'foobar' ^");
+    TEST_1_COMPLETION(L"'foo\\'^", L"bar", 0, false, L"'foo\\'bar' ^");
+    TEST_1_COMPLETION(L"foo\\'^", L"bar", 0, false, L"foo\\'bar ^");
+
+    // Test append only
+    TEST_1_COMPLETION(L"foo^", L"bar", 0, true, L"foobar ^");
+    TEST_1_COMPLETION(L"foo^ baz", L"bar", 0, true, L"foobar ^ baz");
+    TEST_1_COMPLETION(L"'foo^", L"bar", 0, true, L"'foobar' ^");
+    TEST_1_COMPLETION(L"'foo'^", L"bar", 0, true, L"'foo'bar ^");
+    TEST_1_COMPLETION(L"'foo\\'^", L"bar", 0, true, L"'foo\\'bar' ^");
+    TEST_1_COMPLETION(L"foo\\'^", L"bar", 0, true, L"foo\\'bar ^");
+
+    TEST_1_COMPLETION(L"foo^", L"bar", COMPLETE_NO_SPACE, false, L"foobar^");
+    TEST_1_COMPLETION(L"'foo^", L"bar", COMPLETE_NO_SPACE, false, L"'foobar^");
+    TEST_1_COMPLETION(L"'foo'^", L"bar", COMPLETE_NO_SPACE, false, L"'foobar'^");
+    TEST_1_COMPLETION(L"'foo\\'^", L"bar", COMPLETE_NO_SPACE, false, L"'foo\\'bar^");
+    TEST_1_COMPLETION(L"foo\\'^", L"bar", COMPLETE_NO_SPACE, false, L"foo\\'bar^");
+
+    TEST_1_COMPLETION(L"foo^", L"bar", COMPLETE_CASE_INSENSITIVE | COMPLETE_REPLACES_TOKEN, false, L"bar ^");
+    TEST_1_COMPLETION(L"'foo^", L"bar", COMPLETE_CASE_INSENSITIVE | COMPLETE_REPLACES_TOKEN, false, L"bar ^");
 }
 
 static void perform_one_autosuggestion_test(const wcstring &command, const wcstring &wd, const wcstring &expected, long line)
@@ -992,6 +1110,22 @@ static void test_autosuggest_suggest_special()
     system("rm -Rf ~/test_autosuggest_suggest_special/");
 }
 
+static void test_autosuggestion_combining()
+{
+    say(L"Testing autosuggestion combining");
+    assert(combine_command_and_autosuggestion(L"alpha", L"alphabeta") == L"alphabeta");
+
+    // when the last token contains no capital letters, we use the case of the autosuggestion
+    assert(combine_command_and_autosuggestion(L"alpha", L"ALPHABETA") == L"ALPHABETA");
+
+    // when the last token contains capital letters, we use its case
+    assert(combine_command_and_autosuggestion(L"alPha", L"alphabeTa") == L"alPhabeTa");
+
+    // if autosuggestion is not longer than input, use the input's case
+    assert(combine_command_and_autosuggestion(L"alpha", L"ALPHAA") == L"ALPHAA");
+    assert(combine_command_and_autosuggestion(L"alpha", L"ALPHA") == L"alpha");
+}
+
 
 /**
    Test speed of completion calculations
@@ -1024,7 +1158,7 @@ void perf_complete()
         str[0]=c;
         reader_set_buffer(str, 0);
 
-        complete(str, out, COMPLETE_DEFAULT, NULL);
+        complete(str, out, COMPLETION_REQUEST_DEFAULT, NULL);
 
         matches += out.size();
         out.clear();
@@ -1044,7 +1178,7 @@ void perf_complete()
 
         reader_set_buffer(str, 0);
 
-        complete(str, out, COMPLETE_DEFAULT, NULL);
+        complete(str, out, COMPLETION_REQUEST_DEFAULT, NULL);
 
         matches += out.size();
         out.clear();
@@ -1564,10 +1698,16 @@ void history_tests_t::test_history_speed(void)
 */
 int main(int argc, char **argv)
 {
+    std::string tmp = "sldfjsdlkfjsdlkfjlf";
+    for (size_t i=0; i < 1000000; i++) {
+        str2wcstring(tmp);
+    }
+    exit(0);
+
     setlocale(LC_ALL, "");
     srand(time(0));
     configure_thread_assertions_for_testing();
-
+    
     program_name=L"(ignore)";
 
     say(L"Testing low-level functionality");
@@ -1580,9 +1720,7 @@ int main(int argc, char **argv)
     builtin_init();
     reader_init();
     env_init();
-
-    test_word_motion();
-    return 0;
+    
 
     test_format();
     test_escape();
@@ -1598,6 +1736,9 @@ int main(int argc, char **argv)
     test_word_motion();
     test_is_potential_path();
     test_colors();
+    test_complete();
+    test_completion_insertions();
+    test_autosuggestion_combining();
     test_autosuggest_suggest_special();
     history_tests_t::test_history();
     history_tests_t::test_history_merge();

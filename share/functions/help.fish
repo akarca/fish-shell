@@ -1,14 +1,5 @@
-
-#
-# help should use 'open' to find a suitable browser, but only
-# if there is a mime database _and_ DISPLAY is set, since the
-# browser will most likely be graphical. Since most systems which
-# have a mime databe also have the htmlview program, this is mostly a
-# theoretical problem.
-#
-
-function help --description "Show help for the fish shell"
-
+function help --description 'Show help for the fish shell'
+	
 	# Declare variables to set correct scope
 	set -l fish_browser
 	set -l fish_browser_bg
@@ -67,10 +58,13 @@ function help --description "Show help for the fish shell"
 		if type xdg-open > /dev/null
 			set fish_browser xdg-open
 		end
-
-		# On OS X, just use open
+	
+	
+		# On OS X, we go through osascript by default
 		if test (uname) = Darwin
-			set fish_browser (which open)
+			if type osascript >/dev/null
+				set fish_browser osascript
+			end
 		end
 
 	end
@@ -92,12 +86,7 @@ function help --description "Show help for the fish shell"
 			set fish_help_page difference.html
 		case globbing
 			set fish_help_page "index.html\#expand"
-
-		# This command substitution should locate all commands with
-		# documentation.  It's a bit of a hack, since it relies on the
-		# Doxygen markup format to never change.
-
-                case (sed -n 's/.*<h[12]><a class="anchor" \(id\|name\)="\([^"]*\)">.*/\2/p' $__fish_help_dir/commands.html)
+		case (__fish_print_commands)
 			set fish_help_page "commands.html\#$fish_help_item"
 		case $help_topics
 			set fish_help_page "index.html\#$fish_help_item"
@@ -107,15 +96,31 @@ function help --description "Show help for the fish shell"
 				# the annoying useless "builtin" man page bash
 				# installs on OS X
 				set -l man_arg "$__fish_datadir/man/man1/$fish_help_item.1"
-				if test ! -f "$man_arg"
-					set man_arg $fish_help_item
+				if test -f "$man_arg"
+					man $man_arg
+					return
 				end
-				man $man_arg
-				return
 			end
 			set fish_help_page "index.html"
 	end
-
+	
+	set -l page_url
+	if test -f $__fish_help_dir/index.html
+		# Help is installed, use it
+		set page_url file://$__fish_help_dir/$fish_help_page
+	else
+		# Go to the web. Only include one dot in the version string
+		set -l version_string (echo $FISH_VERSION| cut -d . -f 1,2)
+		set page_url http://fishshell.com/docs/$version_string/$fish_help_page
+	end
+	
+	# OS X /usr/bin/open swallows fragments (anchors), so use osascript
+	# Eval is just a cheesy way of removing the hash escaping
+	if test "$fish_browser" = osascript
+		osascript -e 'open location "'(eval echo $page_url)'"'
+		return
+	end
+	
 	if test $fish_browser_bg
 
 		switch $fish_browser
@@ -127,8 +132,8 @@ function help --description "Show help for the fish shell"
 
 		end
 
-		eval "$fish_browser file://$__fish_help_dir/$fish_help_page &"
+		eval "$fish_browser $page_url &"
 	else
-		eval $fish_browser file://$__fish_help_dir/$fish_help_page
+		eval $fish_browser $page_url
 	end
 end

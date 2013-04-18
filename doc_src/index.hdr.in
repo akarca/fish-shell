@@ -11,7 +11,7 @@ This is the documentation for \c fish, the friendly interactive
 shell. \c fish is a user friendly commandline shell intended
 mostly for interactive use. A shell is a program used to execute other
 programs. For the latest information on \c fish, please visit the <a
-href="http://ridiculousfish.com/shell/"><code>fish</code> homepage</a>.
+href="http://fishshell.com/"><code>fish</code> homepage</a>.
 
 \section syntax Syntax overview
 
@@ -284,7 +284,7 @@ turning on colors on GNU systems is \c '--color=auto'. A wrapper
 around \c ls might look like this:
 
 <pre>function ls
-	ls --color=auto $argv
+	command ls --color=auto $argv
 end
 </pre>
 
@@ -292,7 +292,7 @@ There are a few important things that need to be noted about wrapper
 functions:
 
 - Wrappers should always take care to add the $argv variable to the list of parameters to the wrapped command. This makes sure that if the user specifies any additional parameters to the function, they are passed on to the underlying command.
-- If the wrapped command is not the first command to be called by the wrapper, it is necessary to prefix the call to the command with the word 'command' in order to tell fish that the function should not call itself, but rather a command with the same name. Failing to do so will cause infinite recursion bugs.
+- If the wrapper has the same name as the wrapped command, it is necessary to prefix the call to the command with the word 'command' in order to tell fish that the function should not call itself, but rather a command with the same name. Failing to do so will cause infinite recursion bugs.
 
 \subsubsection syntax-function-autoloading Autoloading functions
 
@@ -578,9 +578,8 @@ this list is executed, and substituted by the output. If the output is
 more than one line long, each line will be expanded to a new
 parameter.
 
-A command substitution will not change the value of the <a
-href='#variables-status'>status</a> variable outside of the command
-substitution.
+The exit status of the last run command substitution is available in the <a
+href='#variables-status'>status</a> variable.
 
 Only part of the output can be used, see <a href='#expand-index-range'>index
 range expansion</a> for details.
@@ -828,7 +827,7 @@ creating or updating a variable are:
 
 -# If a variable is explicitly set to either universal, global or local, that setting will be honored. If a variable of the same name exists in a different scope, that variable will not be changed.
 -# If a variable is not explicitly set to be either universal, global or local, but has been previously defined, the variable scope is not changed.
--# If a variable is not explicitly set to be either universal, global or local and has never before been defined, the variable will be local to the currently executing functions. If no function is executing, the variable will be global.
+-# If a variable is not explicitly set to be either universal, global or local and has never before been defined, the variable will be local to the currently executing function. Note that this is different from using the \c -l or \c --local flag. If one of those flags is used, the variable will be local to the most inner currently executing block, while without these the variable will be local to the function. If no function is executing, the variable will be global.
 
 There may be many variables with the same name, but different scopes.
 When using a variable, the variable scope will be searched from the
@@ -970,6 +969,7 @@ certain environment variables.
 - A large number of variable starting with the prefixes \c fish_color and \c fish_pager_color. See <a href='#variables-color'>Variables for changing highlighting colors</a> for more information.
 - \c fish_greeting, which is the greeting message printed on startup.
 - \c LANG, \c LC_ALL, \c LC_COLLATE, \c LC_CTYPE, \c LC_MESSAGES, \c LC_MONETARY, \c LC_NUMERIC and \c LC_TIME set the language option for the shell and subprograms. See the section <a href='#variables-locale'>Locale variables</a> for more information.
+- \c fish_user_paths, which is an array of directories that are appended to PATH. This can be a universal variable.
 - \c PATH, which is an array of directories in which to search for commands
 - \c umask, which is the current file creation mask. The preferred way to change the umask variable is through the <a href="commands.html#umask">umask shellscript function</a>. An attempt to set umask to an invalid value will always fail.
 
@@ -1181,6 +1181,9 @@ cursor when the search began.
 
 History searches can be aborted by pressing the escape key.
 
+Prefixing the commandline with a space will prevent the entire line
+from being stored in the history.
+
 The history is stored in the file '~/.config/fish/fish_history'. It is automatically
 read on startup and merged on program exit.
 
@@ -1250,8 +1253,8 @@ shell:
 end</pre>
 
 <a href="#variables-universal">Universal variables</a> are stored in
-the file .config/fish/fishd.HOSTNAME, where HOSTNAME is the name of your
-computer. Do not edit this file directly, edit them through fish
+the file .config/fish/fishd.MACHINE_ID, where MACHINE_ID is typically your
+MAC address. Do not edit this file directly, edit them through fish
 scripts or by using fish interactively instead.
 
 \section other Other features
@@ -1375,7 +1378,7 @@ translated, a future version of fish should also include translated
 manuals.
 
 To make a translation of fish, you will first need the source code,
-available from the <a href='http://ridiculousfish.com/shell/'>fish
+available from the <a href='http://fishshell.com/'>fish
 homepage</a>. Download the latest version, and then extract it using a
 command like <code>tar -zxf fish-VERSION.tar.gz</code>.
 

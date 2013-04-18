@@ -11,6 +11,7 @@ function alias --description "Legacy function for creating shellscript functions
 
 	set -l name
 	set -l body
+	set -l prefix
 	switch (count $argv)
 
 		case 0
@@ -34,5 +35,18 @@ function alias --description "Legacy function for creating shellscript functions
 			return 1
 	end
 
-	eval "function $name; $body \$argv; end"
+
+	# Prevent the alias from immediately running into an infinite recursion if
+	# $body starts with the same command as $name.
+
+	switch $body
+		case $name $name\ \* $name\t\*
+			if contains $name (builtin --names)
+				set prefix builtin
+			else
+				set prefix command
+			end
+	end
+
+	eval "function $name; $prefix $body \$argv; end"
 end

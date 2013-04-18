@@ -25,10 +25,6 @@
 #include <curses.h>
 #endif
 
-#if HAVE_TERMIO_H
-#include <termio.h>
-#endif
-
 #if HAVE_TERM_H
 #include <term.h>
 #elif HAVE_NCURSES_TERM_H
@@ -60,14 +56,13 @@
 
 #include "complete.h"
 
-/**
-   Command used to start fishd
-*/
+/** Command used to start fishd */
 #define FISHD_CMD L"fishd ^ /tmp/fishd.log.%s"
 
-/**
-   Value denoting a null string
-*/
+// Version for easier debugging
+//#define FISHD_CMD L"fishd"
+
+/** Value denoting a null string */
 #define ENV_NULL L"\x1d"
 
 /** Some configuration path environment variables */
@@ -92,13 +87,13 @@ extern char **__environ;
 */
 struct var_entry_t
 {
-    bool exportv; /**< Whether the variable should be exported */
     wcstring val; /**< The value of the variable */
+    bool exportv; /**< Whether the variable should be exported */
 
     var_entry_t() : exportv(false) { }
 };
 
-typedef std::map<wcstring, var_entry_t*> var_table_t;
+typedef std::map<wcstring, var_entry_t> var_table_t;
 
 bool g_log_forks = false;
 bool g_use_posix_spawn = false; //will usually be set to true
@@ -119,11 +114,11 @@ struct env_node_t
       invisible. If new_scope is set for the global variable node,
       the universe will explode.
     */
-    int new_scope;
+    bool new_scope;
     /**
        Does this node contain any variables which are exported to subshells
     */
-    int exportv;
+    bool exportv;
 
     /**
       Pointer to next level
@@ -131,7 +126,13 @@ struct env_node_t
     struct env_node_t *next;
 
 
-    env_node_t() : new_scope(0), exportv(0), next(NULL) { }
+    env_node_t() : new_scope(false), exportv(false), next(NULL) { }
+
+    /* Returns a pointer to the given entry if present, or NULL. */
+    const var_entry_t *find_entry(const wcstring &key);
+
+    /* Returns the next scope to search in order, respecting the new_scope flag, or NULL if we're done. */
+    env_node_t *next_scope_to_search(void);
 };
 
 class variable_entry_t
@@ -142,15 +143,11 @@ class variable_entry_t
 
 static pthread_mutex_t env_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/**
-   Top node on the function stack
-*/
-static env_node_t *top=0;
+/** Top node on the function stack */
+static env_node_t *top = NULL;
 
-/**
-   Bottom node on the function stack
-*/
-static env_node_t *global_env = 0;
+/** Bottom node on the function stack */
+static env_node_t *global_env = NULL;
 
 
 /**
@@ -158,32 +155,40 @@ static env_node_t *global_env = 0;
 */
 static var_table_t *global;
 
-/**
-   Table of variables that may not be set using the set command.
-*/
-static std::set<wcstring> env_read_only;
+/* Helper class for storing constant strings, without needing to wrap them in a wcstring */
+
+/* Comparer for const string set */
+struct const_string_set_comparer
+{
+    bool operator()(const wchar_t *a, const wchar_t *b)
+    {
+        return wcscmp(a, b) < 0;
+    }
+};
+typedef std::set<const wchar_t *, const_string_set_comparer> const_string_set_t;
+
+/** Table of variables that may not be set using the set command. */
+static const_string_set_t env_read_only;
 
 static bool is_read_only(const wcstring &key)
 {
-    return env_read_only.find(key) != env_read_only.end();
+    return env_read_only.find(key.c_str()) != env_read_only.end();
 }
 
 /**
    Table of variables whose value is dynamically calculated, such as umask, status, etc
 */
-static std::set<wcstring> env_electric;
+static const_string_set_t env_electric;
 
 static bool is_electric(const wcstring &key)
 {
-    return env_electric.find(key) != env_electric.end();
+    return env_electric.find(key.c_str()) != env_electric.end();
 }
-
 
 /**
    Exported variable array used by execv
 */
 static null_terminated_array_t<char> export_array;
-
 
 /**
    Flag for checking if we need to regenerate the exported variable
@@ -194,23 +199,6 @@ static void mark_changed_exported()
 {
     has_changed_exported = true;
 }
-
-/**
-   This string is used to store the value of dynamically
-   generated variables, such as history.
-*/
-static wcstring dyn_var;
-
-/**
-   Variable used by env_get_names to communicate auxiliary information
-   to add_key_to_string_set
-*/
-static int get_names_show_exported;
-/**
-   Variable used by env_get_names to communicate auxiliary information
-   to add_key_to_string_set
-*/
-static int get_names_show_unexported;
 
 /**
    List of all locale variable names
@@ -227,6 +215,23 @@ static const wchar_t * const locale_variable[] =
     L"LC_TIME",
     NULL
 };
+
+
+const var_entry_t *env_node_t::find_entry(const wcstring &key)
+{
+    const var_entry_t *result = NULL;
+    var_table_t::const_iterator where = env.find(key);
+    if (where != env.end())
+    {
+        result = &where->second;
+    }
+    return result;
+}
+
+env_node_t *env_node_t::next_scope_to_search(void)
+{
+    return this->new_scope ? global_env : this->next;
+}
 
 
 /**
@@ -261,7 +266,6 @@ static void start_fishd()
             cmd.insert(0, bin_dir + L"/");
         }
     }
-
     parser_t &parser = parser_t::principal_parser();
     parser.eval(cmd, io_chain_t(), TOP);
 }
@@ -353,7 +357,7 @@ static void handle_locale()
         extern int _nl_msg_cat_cntr;
         _nl_msg_cat_cntr++;
 
-        dcgettext("fish", "Changing language to English", LC_MESSAGES);
+        fish_dcgettext("fish", "Changing language to English", LC_MESSAGES);
 
         if (get_is_interactive())
         {
@@ -389,7 +393,7 @@ static void universal_callback(fish_message_type_t type,
                                const wchar_t *name,
                                const wchar_t *val)
 {
-    const wchar_t *str=0;
+    const wchar_t *str = NULL;
 
     switch (type)
     {
@@ -430,37 +434,32 @@ static void universal_callback(fish_message_type_t type,
 */
 static void setup_path()
 {
-    size_t i;
-    int j;
-    wcstring_list_t lst;
-
     const wchar_t *path_el[] =
     {
         L"/bin",
         L"/usr/bin",
-        PREFIX L"/bin",
-        0
-    }
-    ;
+        NULL
+    };
 
     env_var_t path = env_get_string(L"PATH");
 
-    if (!path.missing())
+    wcstring_list_t lst;
+    if (! path.missing())
     {
         tokenize_variable_array(path, lst);
     }
 
-    for (j=0; path_el[j]; j++)
+    for (size_t j=0; path_el[j] != NULL; j++)
     {
 
-        int has_el=0;
+        bool has_el = false;
 
-        for (i=0; i<lst.size(); i++)
+        for (size_t i=0; i<lst.size(); i++)
         {
-            wcstring el = lst.at(i);
+            const wcstring &el = lst.at(i);
             size_t len = el.size();
 
-            while ((len > 0) && (el[len-1]==L'/'))
+            while ((len > 0) && (el.at(len-1)==L'/'))
             {
                 len--;
             }
@@ -468,11 +467,12 @@ static void setup_path()
             if ((wcslen(path_el[j]) == len) &&
                     (wcsncmp(el.c_str(), path_el[j], len)==0))
             {
-                has_el = 1;
+                has_el = true;
+                break;
             }
         }
 
-        if (!has_el)
+        if (! has_el)
         {
             wcstring buffer;
 
@@ -483,8 +483,8 @@ static void setup_path()
                 buffer += path;
             }
 
-            buffer += ARRAY_SEP_STR;
-            buffer += path_el[j];
+            buffer.append(ARRAY_SEP_STR);
+            buffer.append(path_el[j]);
 
             env_set(L"PATH", buffer.empty()?NULL:buffer.c_str(), ENV_GLOBAL | ENV_EXPORT);
 
@@ -555,8 +555,6 @@ static bool variable_can_be_array(const wcstring &key)
 
 void env_init(const struct config_paths_t *paths /* or NULL */)
 {
-    char **p;
-
     /*
       env_read_only variables can not be altered directly by the user
     */
@@ -607,7 +605,7 @@ void env_init(const struct config_paths_t *paths /* or NULL */)
     /*
       Import environment variables
     */
-    for (p=environ?environ:__environ; p && *p; p++)
+    for (char **p = (environ ? environ : __environ); p && *p; p++)
     {
         const wcstring key_and_val = str2wcstring(*p); //like foo=bar
         size_t eql = key_and_val.find(L'=');
@@ -680,7 +678,7 @@ void env_init(const struct config_paths_t *paths /* or NULL */)
         long shlvl_i = wcstol(shlvl_str.c_str(), NULL, 10);
         if (shlvl_i >= 0)
         {
-            nshlvl_str = format_string(L"%ld", 1 + shlvl_i);
+            nshlvl_str = to_string<long>(shlvl_i + 1);
         }
     }
     env_set(L"SHLVL", nshlvl_str.c_str(), ENV_GLOBAL | ENV_EXPORT);
@@ -709,17 +707,15 @@ void env_destroy()
     env_read_only.clear();
     env_electric.clear();
 
-
     var_table_t::iterator iter;
     for (iter = global->begin(); iter != global->end(); ++iter)
     {
-        var_entry_t *entry = iter->second;
-        if (entry->exportv)
+        const var_entry_t &entry = iter->second;
+        if (entry.exportv)
         {
             mark_changed_exported();
+            break;
         }
-
-        delete entry;
     }
 
     delete top;
@@ -734,19 +730,12 @@ static env_node_t *env_get_node(const wcstring &key)
     env_node_t *env = top;
     while (env != NULL)
     {
-        if (env->env.find(key) != env->env.end())
+        if (env->find_entry(key) != NULL)
         {
             break;
         }
 
-        if (env->new_scope)
-        {
-            env = global_env;
-        }
-        else
-        {
-            env = env->next;
-        }
+        env = env->next_scope_to_search();
     }
     return env;
 }
@@ -754,10 +743,8 @@ static env_node_t *env_get_node(const wcstring &key)
 int env_set(const wcstring &key, const wchar_t *val, int var_mode)
 {
     ASSERT_IS_MAIN_THREAD();
-    env_node_t *node = NULL;
     bool has_changed_old = has_changed_exported;
     bool has_changed_new = false;
-    var_entry_t *e=0;
     int done=0;
 
     int is_universal = 0;
@@ -783,8 +770,8 @@ int env_set(const wcstring &key, const wchar_t *val, int var_mode)
         wchar_t *end;
 
         /*
-             Set the new umask
-             */
+         Set the new umask
+         */
         if (val && wcslen(val))
         {
             errno=0;
@@ -795,17 +782,14 @@ int env_set(const wcstring &key, const wchar_t *val, int var_mode)
                 umask(mask);
             }
         }
-        /*
-             Do not actually create a umask variable, on env_get, it will
-             be calculated dynamically
-             */
+        /* Do not actually create a umask variable, on env_get, it will be calculated dynamically */
         return 0;
     }
 
     /*
-       Zero element arrays are internaly not coded as null but as this
-       placeholder string
-       */
+     Zero element arrays are internaly not coded as null but as this
+     placeholder string
+     */
     if (!val)
     {
         val = ENV_NULL;
@@ -813,141 +797,130 @@ int env_set(const wcstring &key, const wchar_t *val, int var_mode)
 
     if (var_mode & ENV_UNIVERSAL)
     {
-        int exportv = 0;
-
-        if (!(var_mode & ENV_EXPORT) &&
-                !(var_mode & ENV_UNEXPORT))
+        bool exportv;
+        if (var_mode & ENV_EXPORT)
         {
-            env_universal_get_export(key);
+            // export
+            exportv = true;
+        }
+        else if (var_mode & ENV_UNEXPORT)
+        {
+            // unexport
+            exportv = false;
         }
         else
         {
-            exportv = (var_mode & ENV_EXPORT);
+            // not changing the export
+            exportv = env_universal_get_export(key);
         }
-
         env_universal_set(key, val, exportv);
         is_universal = 1;
 
     }
     else
     {
+        // Determine the node
 
-        node = env_get_node(key);
-        if (node)
+        env_node_t *preexisting_node = env_get_node(key);
+        bool preexisting_entry_exportv = false;
+        if (preexisting_node != NULL)
         {
-            var_table_t::iterator result = node->env.find(key);
-            assert(result != node->env.end());
-            e  = result->second;
-
-            if (e->exportv)
+            var_table_t::const_iterator result = preexisting_node->env.find(key);
+            assert(result != preexisting_node->env.end());
+            const var_entry_t &entry = result->second;
+            if (entry.exportv)
             {
+                preexisting_entry_exportv = true;
                 has_changed_new = true;
             }
         }
 
-        if ((var_mode & ENV_LOCAL) ||
-                (var_mode & ENV_GLOBAL))
+        env_node_t *node = NULL;
+        if (var_mode & ENV_GLOBAL)
         {
-            node = (var_mode & ENV_GLOBAL)?global_env:top;
+            node = global_env;
+        }
+        else if (var_mode & ENV_LOCAL)
+        {
+            node = top;
+        }
+        else if (preexisting_node != NULL)
+        {
+            node = preexisting_node;
+
+            if ((var_mode & (ENV_EXPORT | ENV_UNEXPORT)) == 0)
+            {
+                // use existing entry's exportv
+                var_mode = preexisting_entry_exportv ? ENV_EXPORT : 0;
+            }
         }
         else
         {
-            if (node)
+            if (! get_proc_had_barrier())
             {
-                if (!(var_mode & ENV_EXPORT) &&
-                        !(var_mode & ENV_UNEXPORT))
-                {
-                    var_mode = e->exportv?ENV_EXPORT:0;
-                }
+                set_proc_had_barrier(true);
+                env_universal_barrier();
             }
-            else
+
+            if (env_universal_get(key))
             {
-                if (! get_proc_had_barrier())
+                bool exportv;
+                if (var_mode & ENV_EXPORT)
                 {
-                    set_proc_had_barrier(true);
-                    env_universal_barrier();
+                    exportv = true;
                 }
-
-                if (env_universal_get(key))
+                else if (var_mode & ENV_UNEXPORT)
                 {
-                    int exportv = 0;
-
-                    if (!(var_mode & ENV_EXPORT) &&
-                            !(var_mode & ENV_UNEXPORT))
-                    {
-                        env_universal_get_export(key);
-                    }
-                    else
-                    {
-                        exportv = (var_mode & ENV_EXPORT);
-                    }
-
-                    env_universal_set(key, val, exportv);
-                    is_universal = 1;
-
-                    done = 1;
-
+                    exportv = false;
                 }
                 else
                 {
-                    /*
-                               New variable with unspecified scope. The default
-                               scope is the innermost scope that is shadowing,
-                               which will be either the current function or the
-                               global scope.
-                               */
-                    node = top;
-                    while (node->next && !node->new_scope)
-                    {
-                        node = node->next;
-                    }
+                    exportv = env_universal_get_export(key);
+                }
+
+                env_universal_set(key, val, exportv);
+                is_universal = 1;
+
+                done = 1;
+
+            }
+            else
+            {
+                /*
+                 New variable with unspecified scope. The default
+                 scope is the innermost scope that is shadowing,
+                 which will be either the current function or the
+                 global scope.
+                 */
+                node = top;
+                while (node->next && !node->new_scope)
+                {
+                    node = node->next;
                 }
             }
         }
 
         if (!done)
         {
-            var_entry_t *old_entry = NULL;
-            var_table_t::iterator result = node->env.find(key);
-            if (result != node->env.end())
+            // Set the entry in the node
+            // Note that operator[] accesses the existing entry, or creates a new one
+            var_entry_t &entry = node->env[key];
+            if (entry.exportv)
             {
-                old_entry = result->second;
-                node->env.erase(result);
+                // this variable already existed, and was exported
+                has_changed_new = true;
             }
-
-            var_entry_t *entry = NULL;
-            if (old_entry)
+            entry.val = val;
+            if (var_mode & ENV_EXPORT)
             {
-                entry = old_entry;
-
-                if ((var_mode & ENV_EXPORT) || entry->exportv)
-                {
-                    entry->exportv = !!(var_mode & ENV_EXPORT);
-                    has_changed_new = true;
-                }
+                // the new variable is exported
+                entry.exportv = true;
+                node->exportv = true;
+                has_changed_new = true;
             }
             else
             {
-                entry = new var_entry_t;
-
-                if (var_mode & ENV_EXPORT)
-                {
-                    entry->exportv = 1;
-                    has_changed_new = true;
-                }
-                else
-                {
-                    entry->exportv = 0;
-                }
-
-            }
-
-            entry->val = val;
-            node->env[key] = entry;
-
-            if (entry->exportv)
-            {
-                node->exportv=1;
+                entry.exportv = false;
             }
 
             if (has_changed_old || has_changed_new)
@@ -980,33 +953,27 @@ int env_set(const wcstring &key, const wchar_t *val, int var_mode)
 
    \return zero if the variable was not found, non-zero otherwise
 */
-static int try_remove(env_node_t *n,
-                      const wchar_t *key,
-                      int var_mode)
+static bool try_remove(env_node_t *n, const wchar_t *key, int var_mode)
 {
-    if (n == 0)
+    if (n == NULL)
     {
-        return 0;
+        return false;
     }
 
     var_table_t::iterator result = n->env.find(key);
     if (result != n->env.end())
     {
-        var_entry_t *v = result->second;
-
-        if (v->exportv)
+        if (result->second.exportv)
         {
             mark_changed_exported();
         }
-
         n->env.erase(result);
-        delete v;
-        return 1;
+        return true;
     }
 
     if (var_mode & ENV_LOCAL)
     {
-        return 0;
+        return false;
     }
 
     if (n->new_scope)
@@ -1066,13 +1033,6 @@ int env_remove(const wcstring &key, int var_mode)
     return !erased;
 }
 
-env_var_t env_var_t::missing_var(void)
-{
-    env_var_t result(L"");
-    result.is_missing = true;
-    return result;
-}
-
 const wchar_t *env_var_t::c_str(void) const
 {
     assert(! is_missing);
@@ -1118,37 +1078,25 @@ env_var_t env_get_string(const wcstring &key)
             /* Lock around a local region */
             scoped_lock lock(env_lock);
 
-            var_entry_t *res = NULL;
             env_node_t *env = top;
             wcstring result;
 
             while (env != NULL)
             {
-                var_table_t::iterator result =  env->env.find(key);
-                if (result != env->env.end())
-                    res = result->second;
-
-
-                if (res != NULL)
+                const var_entry_t *entry = env->find_entry(key);
+                if (entry != NULL)
                 {
-                    if (res->val == ENV_NULL)
+                    if (entry->val == ENV_NULL)
                     {
                         return env_var_t::missing_var();
                     }
                     else
                     {
-                        return res->val;
+                        return entry->val;
                     }
                 }
 
-                if (env->new_scope)
-                {
-                    env = global_env;
-                }
-                else
-                {
-                    env = env->next;
-                }
+                env = env->next_scope_to_search();
             }
         }
 
@@ -1160,7 +1108,7 @@ env_var_t env_get_string(const wcstring &key)
             env_universal_barrier();
         }
 
-        wchar_t *item = env_universal_get(key);
+        const wchar_t *item = env_universal_get(key);
 
         if (!item || (wcscmp(item, ENV_NULL)==0))
         {
@@ -1173,13 +1121,12 @@ env_var_t env_get_string(const wcstring &key)
     }
 }
 
-int env_exist(const wchar_t *key, int mode)
+bool env_exist(const wchar_t *key, int mode)
 {
-    var_entry_t *res;
     env_node_t *env;
-    wchar_t *item=0;
+    const wchar_t *item = NULL;
 
-    CHECK(key, 0);
+    CHECK(key, false);
 
     /*
       Read only variables all exist, and they are all global. A local
@@ -1192,13 +1139,13 @@ int env_exist(const wchar_t *key, int mode)
             //Such variables are never exported
             if (mode & ENV_EXPORT)
             {
-                return 0;
+                return false;
             }
             else if (mode & ENV_UNEXPORT)
             {
-                return 1;
+                return true;
             }
-            return 1;
+            return true;
         }
     }
 
@@ -1212,31 +1159,24 @@ int env_exist(const wchar_t *key, int mode)
 
             if (result != env->env.end())
             {
-                res  = result->second;
+                const var_entry_t &res = result->second;
 
                 if (mode & ENV_EXPORT)
                 {
-                    return res->exportv == 1;
+                    return res.exportv;
                 }
                 else if (mode & ENV_UNEXPORT)
                 {
-                    return res->exportv == 0;
+                    return ! res.exportv;
                 }
 
-                return 1;
+                return true;
             }
 
             if (mode & ENV_LOCAL)
                 break;
 
-            if (env->new_scope)
-            {
-                env = global_env;
-            }
-            else
-            {
-                env = env->next;
-            }
+            env = env->next_scope_to_search();
         }
     }
 
@@ -1286,7 +1226,7 @@ static int local_scope_exports(env_node_t *n)
     return local_scope_exports(n->next);
 }
 
-void env_push(int new_scope)
+void env_push(bool new_scope)
 {
     env_node_t *node = new env_node_t;
     node->next = top;
@@ -1332,12 +1272,12 @@ void env_pop()
         var_table_t::iterator iter;
         for (iter = killme->env.begin(); iter != killme->env.end(); ++iter)
         {
-            var_entry_t *entry = iter->second;
-            if (entry->exportv)
+            const var_entry_t &entry = iter->second;
+            if (entry.exportv)
             {
                 mark_changed_exported();
+                break;
             }
-            delete entry;
         }
 
         delete killme;
@@ -1357,18 +1297,18 @@ void env_pop()
 /**
    Function used with to insert keys of one table into a set::set<wcstring>
 */
-static void add_key_to_string_set(const var_table_t &envs, std::set<wcstring> &strSet)
+static void add_key_to_string_set(const var_table_t &envs, std::set<wcstring> *str_set, bool show_exported, bool show_unexported)
 {
     var_table_t::const_iterator iter;
     for (iter = envs.begin(); iter != envs.end(); ++iter)
     {
-        var_entry_t *e = iter->second;
+        const var_entry_t &e = iter->second;
 
-        if ((e->exportv && get_names_show_exported) ||
-                (!e->exportv && get_names_show_unexported))
+        if ((e.exportv && show_exported) ||
+                (!e.exportv && show_unexported))
         {
-            /*Insert Key*/
-            strSet.insert(iter->first);
+            /* Insert this key */
+            str_set->insert(iter->first);
         }
 
     }
@@ -1385,12 +1325,8 @@ wcstring_list_t env_get_names(int flags)
     int show_universal = flags & ENV_UNIVERSAL;
 
     env_node_t *n=top;
-
-
-    get_names_show_exported =
-        (flags & ENV_EXPORT) || !(flags & ENV_UNEXPORT);
-    get_names_show_unexported =
-        (flags & ENV_UNEXPORT) || !(flags & ENV_EXPORT);
+    const bool show_exported = (flags & ENV_EXPORT) || !(flags & ENV_UNEXPORT);
+    const bool show_unexported = (flags & ENV_UNEXPORT) || !(flags & ENV_EXPORT);
 
     if (!show_local && !show_global && !show_universal)
     {
@@ -1404,7 +1340,7 @@ wcstring_list_t env_get_names(int flags)
             if (n == global_env)
                 break;
 
-            add_key_to_string_set(n->env, names);
+            add_key_to_string_set(n->env, &names, show_exported, show_unexported);
             if (n->new_scope)
                 break;
             else
@@ -1415,13 +1351,13 @@ wcstring_list_t env_get_names(int flags)
 
     if (show_global)
     {
-        add_key_to_string_set(global_env->env, names);
-        if (get_names_show_unexported)
+        add_key_to_string_set(global_env->env, &names, show_exported, show_unexported);
+        if (show_unexported)
         {
             result.insert(result.end(), env_electric.begin(), env_electric.end());
         }
 
-        if (get_names_show_exported)
+        if (show_exported)
         {
             result.push_back(L"COLUMNS");
             result.push_back(L"LINES");
@@ -1433,9 +1369,9 @@ wcstring_list_t env_get_names(int flags)
     {
 
         wcstring_list_t uni_list;
-        env_universal_get_names2(uni_list,
-                                 get_names_show_exported,
-                                 get_names_show_unexported);
+        env_universal_get_names(uni_list,
+                                show_exported,
+                                show_unexported);
         names.insert(uni_list.begin(), uni_list.end());
     }
 
@@ -1461,11 +1397,11 @@ static void get_exported(const env_node_t *n, std::map<wcstring, wcstring> &h)
     for (iter = n->env.begin(); iter != n->env.end(); ++iter)
     {
         const wcstring &key = iter->first;
-        var_entry_t *val_entry = iter->second;
-        if (val_entry->exportv && (val_entry->val != ENV_NULL))
+        const var_entry_t &val_entry = iter->second;
+        if (val_entry.exportv && (val_entry.val != ENV_NULL))
         {
             // Don't use std::map::insert here, since we need to overwrite existing values from previous scopes
-            h[key] = val_entry->val;
+            h[key] = val_entry.val;
         }
     }
 }
@@ -1475,27 +1411,25 @@ static void export_func(const std::map<wcstring, wcstring> &envs, std::vector<st
     std::map<wcstring, wcstring>::const_iterator iter;
     for (iter = envs.begin(); iter != envs.end(); ++iter)
     {
-        char* ks = wcs2str(iter->first.c_str());
-        char* vs = wcs2str(iter->second.c_str());
-        char *pos = vs;
-        while (*pos)
+        const std::string ks = wcs2string(iter->first);
+        std::string vs = wcs2string(iter->second);
+
+        for (size_t i=0; i < vs.size(); i++)
         {
-            if (*pos == ARRAY_SEP)
-                *pos = ':';
-            pos++;
+            char &vc = vs.at(i);
+            if (vc == ARRAY_SEP)
+                vc = ':';
         }
 
         /* Put a string on the vector */
         out.push_back(std::string());
         std::string &str = out.back();
+        str.reserve(ks.size() + 1 + vs.size());
 
         /* Append our environment variable data to it */
         str.append(ks);
         str.append("=");
         str.append(vs);
-
-        free(ks);
-        free(vs);
     }
 }
 
@@ -1518,11 +1452,11 @@ static void update_export_array_if_necessary(bool recalc)
         get_exported(top, vals);
 
         wcstring_list_t uni;
-        env_universal_get_names2(uni, 1, 0);
+        env_universal_get_names(uni, 1, 0);
         for (i=0; i<uni.size(); i++)
         {
             const wcstring &key = uni.at(i);
-            const wchar_t *val = env_universal_get(key.c_str());
+            const wchar_t *val = env_universal_get(key);
 
             if (wcscmp(val, ENV_NULL))
             {
@@ -1540,18 +1474,11 @@ static void update_export_array_if_necessary(bool recalc)
 
 }
 
-char **env_export_arr(bool recalc)
+const char * const *env_export_arr(bool recalc)
 {
     ASSERT_IS_MAIN_THREAD();
     update_export_array_if_necessary(recalc);
     return export_array.get();
-}
-
-void env_export_arr(bool recalc, null_terminated_array_t<char> &output)
-{
-    ASSERT_IS_MAIN_THREAD();
-    update_export_array_if_necessary(recalc);
-    output = export_array;
 }
 
 env_vars_snapshot_t::env_vars_snapshot_t(const wchar_t * const *keys)

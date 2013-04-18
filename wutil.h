@@ -48,9 +48,13 @@ int wopen(const wcstring &pathname, int flags, mode_t mode = 0);
 /** Wide character version of open() that also sets the close-on-exec flag (atomically when possible). */
 int wopen_cloexec(const wcstring &pathname, int flags, mode_t mode = 0);
 
-/**
-   Wide character version of creat().
-*/
+/** Mark an fd as nonblocking; returns errno or 0 on success */
+int make_fd_nonblocking(int fd);
+
+/** Mark an fd as blocking; returns errno or 0 on success */
+int make_fd_blocking(int fd);
+
+/** Wide character version of creat(). */
 int wcreat(const wcstring &pathname, mode_t mode);
 
 
@@ -81,6 +85,16 @@ int wunlink(const wcstring &pathname);
    Wide character version of perror().
 */
 void wperror(const wcstring &s);
+
+/**
+  Async-safe version of perror().
+*/
+void safe_perror(const char *message);
+
+/**
+  Async-safe version of strerror().
+*/
+const char *safe_strerror(int err);
 
 /**
    Wide character version of getcwd().
@@ -125,7 +139,6 @@ std::wstring wbasename(const std::wstring &path);
    around gettext, like all other functions in this file.
 */
 const wchar_t *wgettext(const wchar_t *in);
-wcstring wgettext2(const wcstring &in);
 
 /**
    Wide character version of getenv

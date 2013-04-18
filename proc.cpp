@@ -22,10 +22,6 @@ Some of the code in this file is based on code from the Glibc manual.
 #include <sys/stat.h>
 #include <algorithm>
 
-#ifdef HAVE_SYS_TERMIOS_H
-#include <sys/termios.h>
-#endif
-
 #ifdef HAVE_SYS_IOCTL_H
 #include <sys/ioctl.h>
 #endif
@@ -39,10 +35,6 @@ Some of the code in this file is based on code from the Glibc manual.
 #include <ncurses.h>
 #else
 #include <curses.h>
-#endif
-
-#if HAVE_TERMIO_H
-#include <termio.h>
 #endif
 
 #if HAVE_TERM_H
@@ -117,6 +109,15 @@ job_iterator_t::job_iterator_t() : job_list(&parser_t::principal_parser().job_li
     this->reset();
 }
 
+void print_jobs(void)
+{
+    job_iterator_t jobs;
+    job_t *j;
+    while ((j = jobs.next()))
+    {
+        printf("%p -> %ls -> (foreground %d, complete %d, stopped %d, constructed %d)\n", j, j->command_wcstr(), job_get_flag(j, JOB_FOREGROUND), job_is_completed(j), job_is_stopped(j), job_get_flag(j, JOB_CONSTRUCTED));
+    }
+}
 
 int is_interactive_session=0;
 int is_subshell=0;
@@ -204,6 +205,7 @@ void proc_destroy()
 
 void proc_set_last_status(int s)
 {
+    ASSERT_IS_MAIN_THREAD();
     last_status = s;
 }
 
@@ -305,17 +307,21 @@ int job_is_completed(const job_t *j)
 
 }
 
-void job_set_flag(job_t *j, int flag, int set)
+void job_set_flag(job_t *j, unsigned int flag, int set)
 {
     if (set)
+    {
         j->flags |= flag;
+    }
     else
-        j->flags = j->flags & ((unsigned int)(-1) ^ flag);
+    {
+        j->flags &= ~flag;
+    }
 }
 
-int job_get_flag(const job_t *j, int flag)
+int job_get_flag(const job_t *j, unsigned int flag)
 {
-    return j->flags&flag?1:0;
+    return !!(j->flags & flag);
 }
 
 int job_signal(job_t *j, int signal)
@@ -357,9 +363,7 @@ int job_signal(job_t *j, int signal)
    Return 0 if all went well, nonzero otherwise.
    This is called from a signal handler.
 */
-static void mark_process_status(const job_t *j,
-                                process_t *p,
-                                int status)
+static void mark_process_status(const job_t *j, process_t *p, int status)
 {
 //	debug( 0, L"Process %ls %ls", p->argv[0], WIFSTOPPED (status)?L"stopped":(WIFEXITED( status )?L"exited":(WIFSIGNALED( status )?L"signaled to exit":L"BLARGH")) );
     p->status = status;
@@ -396,7 +400,10 @@ static void mark_process_status(const job_t *j,
 void job_mark_process_as_failed(const job_t *job, process_t *p)
 {
     /* The given process failed to even lift off (e.g. posix_spawn failed) and so doesn't have a valid pid. Mark it as dead. */
-    p->completed = 1;
+    for (process_t *cursor = p; cursor != NULL; cursor = cursor->next)
+    {
+        cursor->completed = 1;
+    }
 }
 
 /**
@@ -410,8 +417,8 @@ void job_mark_process_as_failed(const job_t *job, process_t *p)
 static void handle_child_status(pid_t pid, int status)
 {
     bool found_proc = false;
-    const job_t *j=0;
-    process_t *p=0;
+    const job_t *j = NULL;
+    process_t *p = NULL;
 //	char mess[MESS_SIZE];
     /*
       snprintf( mess,
@@ -544,7 +551,6 @@ job_t::~job_t()
 {
     if (first_process != NULL)
         delete first_process;
-    io_chain_destroy(this->io);
     release_job_id(job_id);
 }
 
@@ -631,7 +637,6 @@ int job_reap(bool interactive)
     {
         job_t *j = jnext;
         jnext = jobs.next();
-        process_t *p;
 
         /*
           If we are reaping only jobs who do not need status messages
@@ -643,7 +648,7 @@ int job_reap(bool interactive)
             continue;
         }
 
-        for (p=j->first_process; p; p=p->next)
+        for (process_t *p = j->first_process; p; p=p->next)
         {
             int s;
             if (!p->completed)
@@ -869,10 +874,11 @@ static int select_try(job_t *j)
 
     for (size_t idx = 0; idx < j->io.size(); idx++)
     {
-        const io_data_t *d = j->io.at(idx);
-        if (d->io_mode == IO_BUFFER)
+        const io_data_t *io = j->io.at(idx).get();
+        if (io->io_mode == IO_BUFFER)
         {
-            int fd = d->param1.pipe_fd[0];
+            CAST_INIT(const io_pipe_t *, io_pipe, io);
+            int fd = io_pipe->pipe_fd[0];
 //			fwprintf( stderr, L"fd %d on job %ls\n", fd, j->command );
             FD_SET(fd, &fds);
             maxfd = maxi(maxfd, fd);
@@ -902,17 +908,17 @@ static int select_try(job_t *j)
 */
 static void read_try(job_t *j)
 {
-    io_data_t *buff=NULL;
+    io_buffer_t *buff = NULL;
 
     /*
       Find the last buffer, which is the one we want to read from
     */
     for (size_t idx = 0; idx < j->io.size(); idx++)
     {
-        io_data_t *d = j->io.at(idx);
+        io_data_t *d = j->io.at(idx).get();
         if (d->io_mode == IO_BUFFER)
         {
-            buff=d;
+            buff = static_cast<io_buffer_t *>(d);
         }
     }
 
@@ -924,7 +930,7 @@ static void read_try(job_t *j)
             char b[BUFFER_SIZE];
             long l;
 
-            l=read_blocked(buff->param1.pipe_fd[0],
+            l=read_blocked(buff->pipe_fd[0],
                            b, BUFFER_SIZE);
             if (l==0)
             {
@@ -958,7 +964,7 @@ static void read_try(job_t *j)
    a job that has previously been stopped. In that case, we need to
    set the terminal attributes to those saved in the job.
  */
-static int terminal_give_to_job(job_t *j, int cont)
+static bool terminal_give_to_job(job_t *j, int cont)
 {
 
     if (tcsetpgrp(0, j->pgid))
@@ -968,7 +974,7 @@ static int terminal_give_to_job(job_t *j, int cont)
               j->job_id,
               j->command_wcstr());
         wperror(L"tcsetpgrp");
-        return 0;
+        return false;
     }
 
     if (cont)
@@ -980,10 +986,10 @@ static int terminal_give_to_job(job_t *j, int cont)
                   j->job_id,
                   j->command_wcstr());
             wperror(L"tcsetattr");
-            return 0;
+            return false;
         }
     }
-    return 1;
+    return true;
 }
 
 /**
@@ -1030,7 +1036,7 @@ static int terminal_return_from_job(job_t *j)
     return 1;
 }
 
-void job_continue(job_t *j, int cont)
+void job_continue(job_t *j, bool cont)
 {
     /*
       Put job first in the job list
@@ -1052,18 +1058,17 @@ void job_continue(job_t *j, int cont)
     {
         if (job_get_flag(j, JOB_TERMINAL) && job_get_flag(j, JOB_FOREGROUND))
         {
-            /* Put the job into the foreground.  */
-            int ok;
-
+            /* Put the job into the foreground. Hack: ensure that stdin is marked as blocking first (#176). */
+            make_fd_blocking(STDIN_FILENO);
+            
             signal_block();
 
-            ok = terminal_give_to_job(j, cont);
+            bool ok = terminal_give_to_job(j, cont);
 
             signal_unblock();
 
             if (!ok)
                 return;
-
         }
 
         /*
@@ -1179,7 +1184,6 @@ void job_continue(job_t *j, int cont)
             // were sometimes having their output combined with the set_color calls in the wrong order!
             read_try(j);
 
-
             process_t *p = j->first_process;
             while (p->next)
                 p = p->next;
@@ -1188,7 +1192,7 @@ void job_continue(job_t *j, int cont)
             {
                 /*
                    Mark process status only if we are in the foreground
-                   and the last process in a pipe, and it is not a short circuted builtin
+                   and the last process in a pipe, and it is not a short circuited builtin
                 */
                 if (p->pid)
                 {
@@ -1198,9 +1202,8 @@ void job_continue(job_t *j, int cont)
                 }
             }
         }
-        /*
-           Put the shell back in the foreground.
-        */
+        
+        /* Put the shell back in the foreground. */
         if (job_get_flag(j, JOB_TERMINAL) && job_get_flag(j, JOB_FOREGROUND))
         {
             int ok;

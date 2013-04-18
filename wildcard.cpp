@@ -225,7 +225,7 @@ static bool wildcard_complete_internal(const wcstring &orig,
         wcstring out_completion;
         wcstring out_desc = (desc ? desc : L"");
 
-        if (flags & COMPLETE_NO_CASE)
+        if (flags & COMPLETE_REPLACES_TOKEN)
         {
             out_completion = orig;
         }
@@ -292,7 +292,7 @@ static bool wildcard_complete_internal(const wcstring &orig,
     }
     else if (towlower(*wc) == towlower(*str))
     {
-        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, flags | COMPLETE_NO_CASE);
+        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, flags | COMPLETE_CASE_INSENSITIVE | COMPLETE_REPLACES_TOKEN);
     }
     return false;
 }
@@ -336,9 +336,9 @@ static wcstring complete_get_desc_suffix_internal(const wcstring &suff)
     wcstring_list_t lst;
     wcstring desc;
 
-    if (exec_subshell(cmd, lst) != -1)
+    if (exec_subshell(cmd, lst, false /* do not apply exit status */) != -1)
     {
-        if (lst.size()>0)
+        if (! lst.empty())
         {
             const wcstring & ln = lst.at(0);
             if (ln.size() > 0 && ln != L"unknown")
@@ -620,7 +620,7 @@ static void wildcard_completion_allocate(std::vector<completion_t> &list,
     bool wants_desc = !(expand_flags & EXPAND_NO_DESCRIPTIONS);
     wcstring desc;
     if (wants_desc)
-        desc = file_get_desc(fullname.c_str(), lstat_res, lbuf, stat_res, buf, stat_errno);
+        desc = file_get_desc(fullname, lstat_res, lbuf, stat_res, buf, stat_errno);
 
     if (sz >= 0 && S_ISDIR(buf.st_mode))
     {
@@ -703,8 +703,7 @@ static int wildcard_expand_internal(const wchar_t *wc,
                                     expand_flags_t flags,
                                     std::vector<completion_t> &out,
                                     std::set<wcstring> &completion_set,
-                                    std::set<file_id_t> &visited_files
-                                   )
+                                    std::set<file_id_t> &visited_files)
 {
 
     /* Points to the end of the current wildcard segment */
@@ -728,7 +727,7 @@ static int wildcard_expand_internal(const wchar_t *wc,
 
     //  debug( 3, L"WILDCARD_EXPAND %ls in %ls", wc, base_dir );
 
-    if (reader_interrupted())
+    if (is_main_thread() ? reader_interrupted() : reader_thread_job_is_stale())
     {
         return -1;
     }
@@ -1095,7 +1094,7 @@ int wildcard_expand(const wchar_t *wc,
         {
             completion_t &c = out.at(i);
 
-            if (c.flags & COMPLETE_NO_CASE)
+            if (c.flags & COMPLETE_REPLACES_TOKEN)
             {
                 c.completion = format_string(L"%ls%ls%ls", base_dir, wc_base.c_str(), c.completion.c_str());
             }
