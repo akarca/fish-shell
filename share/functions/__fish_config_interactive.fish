@@ -209,9 +209,9 @@ function __fish_config_interactive -d "Initializations that should be performed 
 	__fish_reload_key_bindings
 
 	# Repaint screen when window changes size
-	function __fish_winch_handler --on-signal winch
-		commandline -f repaint
-	end
+	#function __fish_winch_handler --on-signal winch
+	#	commandline -f repaint
+	#end
 
 	# The first time a command is not found, look for command-not-found
 	# This is not cheap so we try to avoid doing it during startup
