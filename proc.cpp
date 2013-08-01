@@ -296,15 +296,19 @@ int job_is_stopped(const job_t *j)
 
    \param j the job to test
 */
-int job_is_completed(const job_t *j)
+bool job_is_completed(const job_t *j)
 {
-    process_t *p;
     assert(j->first_process != NULL);
-    for (p = j->first_process; p->next; p = p->next)
-        ;
-
-    return p->completed;
-
+    bool result = true;
+    for (process_t *p = j->first_process; p != NULL; p = p->next)
+    {
+        if (! p->completed)
+        {
+            result = false;
+            break;
+        }
+    }
+    return result;
 }
 
 void job_set_flag(job_t *j, unsigned int flag, int set)
@@ -1060,7 +1064,7 @@ void job_continue(job_t *j, bool cont)
         {
             /* Put the job into the foreground. Hack: ensure that stdin is marked as blocking first (#176). */
             make_fd_blocking(STDIN_FILENO);
-            
+
             signal_block();
 
             bool ok = terminal_give_to_job(j, cont);
@@ -1202,7 +1206,7 @@ void job_continue(job_t *j, bool cont)
                 }
             }
         }
-        
+
         /* Put the shell back in the foreground. */
         if (job_get_flag(j, JOB_TERMINAL) && job_get_flag(j, JOB_FOREGROUND))
         {

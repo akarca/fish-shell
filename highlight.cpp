@@ -1035,7 +1035,7 @@ static void tokenize(const wchar_t * const buff, std::vector<int> &color, const 
                         bool is_cmd = false;
                         int is_subcommand = 0;
                         int mark = tok_get_pos(&tok);
-                        color.at(tok_get_pos(&tok)) = HIGHLIGHT_COMMAND;
+                        color.at(tok_get_pos(&tok)) = use_builtin ? HIGHLIGHT_COMMAND : HIGHLIGHT_ERROR;
 
                         if (parser_keywords_is_subcommand(cmd))
                         {
@@ -1048,7 +1048,7 @@ static void tokenize(const wchar_t * const buff, std::vector<int> &color, const 
                                 use_command  = 0;
                                 use_builtin  = 1;
                             }
-                            else if (cmd == L"command")
+                            else if (cmd == L"command" || cmd == L"exec")
                             {
                                 use_command  = 1;
                                 use_function = 0;
@@ -1105,6 +1105,9 @@ static void tokenize(const wchar_t * const buff, std::vector<int> &color, const 
 
                             if (! is_cmd && use_function)
                                 is_cmd = function_exists_no_autoload(cmd, vars);
+
+                            if (! is_cmd)
+                                is_cmd = expand_abbreviation(cmd, NULL);
 
                             /*
                              Moving on to expensive tests
@@ -1319,33 +1322,32 @@ void highlight_shell(const wcstring &buff, std::vector<int> &color, size_t pos, 
 
     std::fill(color.begin(), color.end(), -1);
 
-    /* Do something sucky and get the current working directory on this background thread. This should really be passed in. Note that we also need this as a vector (of one directory). */
-    const wcstring working_directory = get_working_directory();
+    /* Do something sucky and get the current working directory on this background thread. This should really be passed in. */
+    const wcstring working_directory = env_get_pwd_slash();
 
     /* Tokenize the string */
     tokenize(buff.c_str(), color, pos, error, working_directory, vars);
 
-    /*
-      Locate and syntax highlight cmdsubsts recursively
-    */
+    /* Locate and syntax highlight cmdsubsts recursively */
 
     wchar_t * const subbuff = wcsdup(buff.c_str());
     wchar_t * subpos = subbuff;
-    int done=0;
+    bool done = false;
 
     while (1)
     {
         wchar_t *begin, *end;
 
-        if (parse_util_locate_cmdsubst(subpos, &begin, &end, 1) <= 0)
+        if (parse_util_locate_cmdsubst(subpos, &begin, &end, true) <= 0)
         {
             break;
         }
 
+        /* Note: This *end = 0 writes into subbuff! */
         if (!*end)
-            done=1;
+            done = true;
         else
-            *end=0;
+            *end = 0;
 
         //our subcolors start at color + (begin-subbuff)+1
         size_t start = begin - subbuff + 1, len = wcslen(begin + 1);
@@ -1377,10 +1379,15 @@ void highlight_shell(const wcstring &buff, std::vector<int> &color, size_t pos, 
     int last_val=0;
     for (size_t i=0; i < buff.size(); i++)
     {
-        if (color.at(i) >= 0)
-            last_val = color.at(i);
+        int &current_val = color.at(i);
+        if (current_val >= 0)
+        {
+            last_val = current_val;
+        }
         else
-            color.at(i) = last_val;
+        {
+            current_val = last_val; //note - this writes into the vector
+        }
     }
 
     /*

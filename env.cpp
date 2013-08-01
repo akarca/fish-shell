@@ -137,7 +137,6 @@ struct env_node_t
 
 class variable_entry_t
 {
-    bool exportv; /**< Whether the variable should be exported */
     wcstring value; /**< Value of the variable */
 };
 
@@ -505,6 +504,20 @@ int env_set_pwd()
     }
     env_set(L"PWD", dir_path, ENV_EXPORT | ENV_GLOBAL);
     return 1;
+}
+
+wcstring env_get_pwd_slash(void)
+{
+    env_var_t pwd = env_get_string(L"PWD");
+    if (pwd.missing_or_empty())
+    {
+        return L"";
+    }
+    if (! string_suffixes_string(L"/", pwd))
+    {
+        pwd.push_back(L'/');
+    }
+    return pwd;
 }
 
 /**
@@ -1062,7 +1075,7 @@ env_var_t env_get_string(const wcstring &key)
     }
     else if (key == L"LINES")
     {
-        return to_string(common_get_width());
+        return to_string(common_get_height());
     }
     else if (key == L"status")
     {

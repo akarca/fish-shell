@@ -19,6 +19,7 @@ conf_arg=$@
 
 AC_SUBST(docdir)
 AC_SUBST(HAVE_GETTEXT)
+AC_SUBST(HAVE_DOXYGEN)
 AC_SUBST(LDFLAGS_FISH)
 AC_SUBST(LIBS_FISH)
 AC_SUBST(LIBS_FISH_INDENT)
@@ -86,6 +87,17 @@ else
   AC_MSG_RESULT([no])
 fi
 
+#
+# Set up various programs needed for install
+# Note AC_PROG_CXX sets CXXFLAGS if not set, which we want
+# So ensure this happens before we modify CXXFLAGS below
+#
+
+AC_PROG_CXX([g++ c++])
+AC_PROG_CPP
+AC_PROG_INSTALL
+
+echo "CXXFLAGS: $CXXFLAGS"
 
 #
 # Detect directories which may contain additional headers, libraries
@@ -148,15 +160,6 @@ AH_BOTTOM([#if __GNUC__ >= 3
 
 
 #
-# Set up various programs needed for install
-#
-
-AC_PROG_CXX([g++ c++])
-AC_PROG_CPP
-AC_PROG_INSTALL
-
-
-#
 # Optionally drop gettext support
 #
 
@@ -180,6 +183,47 @@ AS_IF([test x$local_gettext != xno],
       local_gettext=no
     fi
    ],
+)
+
+#
+# Build/clean the documentation only if Doxygen is available
+#
+
+doxygen_minimum=1.5
+
+AC_ARG_WITH(
+  doxygen,
+  AS_HELP_STRING(
+    [--with-doxygen],
+    [use Doxygen to regenerate documentation]
+  ),
+  [use_doxygen=$withval],
+  [use_doxygen=auto]
+)
+
+AS_IF([test "$use_doxygen" != "no"],
+  [
+    AC_CHECK_PROGS([found_doxygen], [doxygen], [no])
+    if test "$found_doxygen" != no; then
+      # test version
+      AC_MSG_CHECKING([the doxygen version])
+      doxygen_version=`doxygen --version 2>/dev/null`
+      AC_MSG_RESULT([$doxygen_version])
+      AS_VERSION_COMPARE([$doxygen_version], [$doxygen_minimum],
+        [ if test "$use_doxygen" = auto; then
+            AC_MSG_WARN([doxygen version $doxygen_version found, but $doxygen_minimum required])
+            HAVE_DOXYGEN=0
+          else
+            AC_MSG_FAILURE([doxygen version $doxygen_version found, but $doxygen_minimum required])
+          fi
+        ],
+        [HAVE_DOXYGEN=1], [HAVE_DOXYGEN=1])
+    elif test "$use_doxygen" != auto; then
+      AC_MSG_FAILURE([--with-doxygen was given, but the doxygen program could not be found])
+    else
+      HAVE_DOXYGEN=0
+    fi
+  ],
 )
 
 #
@@ -219,6 +263,10 @@ if test "$GCC" = yes; then
       fi
     fi
   fi
+
+  # fish does not use exceptions
+  # Disabling exceptions saves about 20% (!) of the compiled code size
+  CXXFLAGS="$CXXFLAGS -fno-exceptions"
 
 
   #
@@ -505,7 +553,7 @@ LIBS=$LIBS_COMMON
 # Check presense of various header files
 #
 
-AC_CHECK_HEADERS([getopt.h termios.h sys/resource.h term.h ncurses/term.h ncurses.h curses.h stropts.h siginfo.h sys/select.h sys/ioctl.h execinfo.h spawn.h])
+AC_CHECK_HEADERS([getopt.h termios.h sys/resource.h term.h ncurses/term.h ncurses.h curses.h stropts.h siginfo.h sys/select.h sys/ioctl.h execinfo.h spawn.h sys/sysctl.h])
 
 if test x$local_gettext != xno; then
   AC_CHECK_HEADERS([libintl.h])

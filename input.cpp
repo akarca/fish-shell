@@ -113,6 +113,8 @@ static const wchar_t * const name_arr[] =
     L"history-token-search-backward",
     L"history-token-search-forward",
     L"self-insert",
+    L"transpose-chars",
+    L"transpose-words",
     L"null",
     L"eof",
     L"vi-arg-digit",
@@ -197,6 +199,8 @@ static const wchar_t code_arr[] =
     R_HISTORY_TOKEN_SEARCH_BACKWARD,
     R_HISTORY_TOKEN_SEARCH_FORWARD,
     R_SELF_INSERT,
+    R_TRANSPOSE_CHARS,
+    R_TRANSPOSE_WORDS,
     R_NULL,
     R_EOF,
     R_VI_ARG_DIGIT,
@@ -336,7 +340,8 @@ int input_init()
 
     input_common_init(&interrupt_handler);
 
-    if (setupterm(0, STDOUT_FILENO, 0) == ERR)
+    int errret;
+    if (setupterm(0, STDOUT_FILENO, &errret) == ERR)
     {
         debug(0, _(L"Could not set up terminal"));
         exit_without_destructors(1);
@@ -385,7 +390,7 @@ void input_destroy()
 static wint_t input_exec_binding(const input_mapping_t &m, const wcstring &seq)
 {
     wchar_t code = input_function_get_code(m.command);
-    if (code != -1)
+    if (code != (wchar_t)-1)
     {
         switch (code)
         {
@@ -796,8 +801,8 @@ bool input_terminfo_get_sequence(const wchar_t *name, wcstring *out_seq)
     {
         errno = err;
         return false;
-    }   
-    
+    }
+
     *out_seq = format_string(L"%s", res);
     return true;
 

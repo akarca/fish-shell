@@ -1,15 +1,19 @@
 # name: Robbyrussell
 # author: Bruno Ferreira Pinto
 
-function _git_branch_name
-  echo (git symbolic-ref HEAD ^/dev/null | sed -e 's|^refs/heads/||')
-end
-
-function _is_git_dirty
-  echo (git status -s --ignore-submodules=dirty ^/dev/null)
-end
-
 function fish_prompt
+
+  if not set -q -g __fish_robbyrussell_functions_defined
+    set -g __fish_robbyrussell_functions_defined
+    function _git_branch_name
+      echo (git symbolic-ref HEAD ^/dev/null | sed -e 's|^refs/heads/||')
+    end
+	
+    function _is_git_dirty
+      echo (git status -s --ignore-submodules=dirty ^/dev/null)
+    end
+  end
+
   set -l cyan (set_color -o cyan)
   set -l yellow (set_color -o yellow)
   set -l red (set_color -o red)
@@ -29,5 +33,5 @@ function fish_prompt
     end
   end
 
-  echo -n -s $arrow $cwd $git_info $normal '>'
+  echo -n -s $arrow ' '$cwd $git_info $normal ' '
 end

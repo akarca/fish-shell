@@ -97,8 +97,8 @@ commence.
 #include "iothread.h"
 #include "intern.h"
 #include "path.h"
-
 #include "parse_util.h"
+#include "parser_keywords.h"
 
 /**
    Maximum length of prefix string when printing completion
@@ -182,6 +182,8 @@ static pthread_key_t generation_count_key;
 /* A color is an int */
 typedef int color_t;
 
+static void set_command_line_and_position(const wcstring &new_str, size_t pos);
+
 /**
    A struct describing the state of the interactive reader. These
    states can be stacked, in case reader_readline() calls are
@@ -202,6 +204,9 @@ public:
 
     /** When backspacing, we temporarily suppress autosuggestions */
     bool suppress_autosuggestion;
+
+    /** Whether abbreviations are expanded */
+    bool expand_abbreviations;
 
     /** The representation of the current screen contents */
     screen_t screen;
@@ -243,6 +248,9 @@ public:
 
     /** Do what we need to do whenever our command line changes */
     void command_line_changed(void);
+
+    /** Expand abbreviations at the current cursor position. */
+    bool expand_abbreviation_as_necessary();
 
     /** The current position of the cursor in buff. */
     size_t buff_pos;
@@ -326,6 +334,7 @@ public:
     reader_data_t() :
         allow_autosuggestion(0),
         suppress_autosuggestion(0),
+        expand_abbreviations(0),
         history(0),
         token_history_pos(0),
         search_pos(0),
@@ -635,6 +644,159 @@ void reader_data_t::command_line_changed()
     s_generation_count++;
 }
 
+/* Expand abbreviations at the given cursor position. Does NOT inspect 'data'. */
+bool reader_expand_abbreviation_in_command(const wcstring &cmdline, size_t cursor_pos, wcstring *output)
+{
+    /* See if we are at "command position". Get the surrounding command substitution, and get the extent of the first token. */
+    const wchar_t * const buff = cmdline.c_str();
+    const wchar_t *cmdsub_begin = NULL, *cmdsub_end = NULL;
+    parse_util_cmdsubst_extent(buff, cursor_pos, &cmdsub_begin, &cmdsub_end);
+    assert(cmdsub_begin != NULL && cmdsub_begin >= buff);
+    assert(cmdsub_end != NULL && cmdsub_end >= cmdsub_begin);
+
+    /* Determine the offset of this command substitution */
+    const size_t subcmd_offset = cmdsub_begin - buff;
+
+    const wcstring subcmd = wcstring(cmdsub_begin, cmdsub_end - cmdsub_begin);
+    const wchar_t *subcmd_cstr = subcmd.c_str();
+
+    /* Get the token before the cursor */
+    const wchar_t *subcmd_tok_begin = NULL, *subcmd_tok_end = NULL;
+    assert(cursor_pos >= subcmd_offset);
+    size_t subcmd_cursor_pos = cursor_pos - subcmd_offset;
+    parse_util_token_extent(subcmd_cstr, subcmd_cursor_pos, &subcmd_tok_begin, &subcmd_tok_end, NULL, NULL);
+
+    /* Compute the offset of the token before the cursor within the subcmd */
+    assert(subcmd_tok_begin >= subcmd_cstr);
+    assert(subcmd_tok_end >= subcmd_tok_begin);
+    const size_t subcmd_tok_begin_offset = subcmd_tok_begin - subcmd_cstr;
+    const size_t subcmd_tok_length = subcmd_tok_end - subcmd_tok_begin;
+
+    /* Now parse the subcmd, looking for commands */
+    bool had_cmd = false, previous_token_is_cmd = false;
+    tokenizer_t tok(subcmd_cstr, TOK_ACCEPT_UNFINISHED | TOK_SQUASH_ERRORS);
+    for (; tok_has_next(&tok); tok_next(&tok))
+    {
+        size_t tok_pos = static_cast<size_t>(tok_get_pos(&tok));
+        if (tok_pos > subcmd_tok_begin_offset)
+        {
+            /* We've passed the token we're interested in */
+            break;
+        }
+
+        int last_type = tok_last_type(&tok);
+
+        switch (last_type)
+        {
+            case TOK_STRING:
+            {
+                if (had_cmd)
+                {
+                    /* Parameter to the command. */
+                }
+                else
+                {
+                    const wcstring potential_cmd = tok_last(&tok);
+                    if (parser_keywords_is_subcommand(potential_cmd))
+                    {
+                        if (potential_cmd == L"command" || potential_cmd == L"builtin")
+                        {
+                            /* 'command' and 'builtin' defeat abbreviation expansion. Skip this command. */
+                            had_cmd = true;
+                        }
+                        else
+                        {
+                            /* Other subcommand. Pretend it doesn't exist so that we can expand the following command */
+                            had_cmd = false;
+                        }
+                    }
+                    else
+                    {
+                        /* It's a normal command */
+                        had_cmd = true;
+                        if (tok_pos == subcmd_tok_begin_offset)
+                        {
+                            /* This is the token we care about! */
+                            previous_token_is_cmd = true;
+                        }
+                    }
+                }
+                break;
+            }
+
+            case TOK_REDIRECT_NOCLOB:
+            case TOK_REDIRECT_OUT:
+            case TOK_REDIRECT_IN:
+            case TOK_REDIRECT_APPEND:
+            case TOK_REDIRECT_FD:
+            {
+                if (!had_cmd)
+                {
+                    break;
+                }
+                tok_next(&tok);
+                break;
+            }
+
+            case TOK_PIPE:
+            case TOK_BACKGROUND:
+            case TOK_END:
+            {
+                had_cmd = false;
+                break;
+            }
+
+            case TOK_COMMENT:
+            case TOK_ERROR:
+            default:
+            {
+                break;
+            }
+        }
+    }
+
+    bool result = false;
+    if (previous_token_is_cmd)
+    {
+        /* The token is a command. Try expanding it as an abbreviation. */
+        const wcstring token = wcstring(subcmd, subcmd_tok_begin_offset, subcmd_tok_length);
+        wcstring abbreviation;
+        if (expand_abbreviation(token, &abbreviation))
+        {
+            /* There was an abbreviation! Replace the token in the full command. Maintain the relative position of the cursor. */
+            if (output != NULL)
+            {
+                size_t cmd_tok_begin_offset = subcmd_tok_begin_offset + subcmd_offset;
+                output->assign(cmdline);
+                output->replace(cmd_tok_begin_offset, subcmd_tok_length, abbreviation);
+            }
+            result = true;
+        }
+    }
+    return result;
+}
+
+/* Expand abbreviations. This may change the command line but does NOT repaint it. This is to allow the caller to coalesce repaints. */
+bool reader_data_t::expand_abbreviation_as_necessary()
+{
+    bool result = false;
+    if (this->expand_abbreviations)
+    {
+        /* Try expanding abbreviations */
+        wcstring new_cmdline;
+        if (reader_expand_abbreviation_in_command(this->command_line, this->buff_pos, &new_cmdline))
+        {
+            /* We expanded an abbreviation! The cursor moves by the difference in the command line lengths. */
+            size_t new_buff_pos = this->buff_pos + new_cmdline.size() - this->command_line.size();
+
+            this->command_line.swap(new_cmdline);
+            data->buff_pos = new_buff_pos;
+            data->command_line_changed();
+            result = true;
+        }
+    }
+    return result;
+}
 
 /** Sorts and remove any duplicate completions in the list. */
 static void sort_and_make_unique(std::vector<completion_t> &l)
@@ -874,7 +1036,7 @@ void reader_react_to_color_change()
 {
     if (! data)
         return;
-    
+
     if (! data->repaint_needed || ! data->screen_reset_needed)
     {
         data->repaint_needed = true;
@@ -948,29 +1110,6 @@ static int insert_char(wchar_t c)
 
 
 /**
-   Calculate the length of the common prefix substring of two strings.
-*/
-static size_t comp_len(const wchar_t *a, const wchar_t *b)
-{
-    size_t i;
-    for (i=0; a[i] != L'\0' && b[i] != L'\0' && a[i]==b[i]; i++)
-        ;
-    return i;
-}
-
-/**
-   Calculate the case insensitive length of the common prefix substring of two strings.
-*/
-static size_t comp_ilen(const wchar_t *a, const wchar_t *b)
-{
-    size_t i;
-    for (i=0; a[i] != L'\0' && b[i] != L'\0' && towlower(a[i])==towlower(b[i]); i++)
-        ;
-    return i;
-}
-
-
-/**
    Insert the string in the given command line at the given cursor
    position. The function checks if the string is quoted or not and
    correctly escapes the string.
@@ -1006,7 +1145,7 @@ wcstring completion_apply_to_command_line(const wcstring &val_str, complete_flag
         if (do_escape)
         {
             /* Respect COMPLETE_DONT_ESCAPE_TILDES */
-            bool no_tilde = !! (flags & COMPLETE_DONT_ESCAPE_TILDES);
+            bool no_tilde = !!(flags & COMPLETE_DONT_ESCAPE_TILDES);
             escaped = escape(val, ESCAPE_ALL | ESCAPE_NO_QUOTED | (no_tilde ? ESCAPE_NO_TILDE : 0));
             sb.append(escaped);
             move_cursor = wcslen(escaped);
@@ -1163,34 +1302,18 @@ static void run_pager(const wcstring &prefix, int is_quoted, const std::vector<c
 
     escaped_separator = escape(COMPLETE_SEP_STR, 1);
 
-    bool has_case_sensitive = false;
     for (size_t i=0; i< comp.size(); i++)
     {
-        const completion_t &el = comp.at(i);
-        if (!(el.flags & COMPLETE_CASE_INSENSITIVE))
-        {
-            has_case_sensitive = true;
-            break;
-        }
-    }
-
-    for (size_t i=0; i< comp.size(); i++)
-    {
-
         long base_len=-1;
         const completion_t &el = comp.at(i);
 
         wcstring completion_text;
         wcstring description_text;
 
-        if (has_case_sensitive && (el.flags & COMPLETE_CASE_INSENSITIVE))
-        {
-            continue;
-        }
-
         // Note that an empty completion is perfectly sensible here, e.g. tab-completing 'foo' with a file called 'foo' and another called 'foobar'
-        if (el.flags & COMPLETE_REPLACES_TOKEN)
+        if ((el.flags & COMPLETE_REPLACES_TOKEN) && match_type_shares_prefix(el.match.type))
         {
+            // Compute base_len if we have not yet
             if (base_len == -1)
             {
                 const wchar_t *begin, *buff = data->command_line.c_str();
@@ -1275,7 +1398,7 @@ struct autosuggestion_context_t
         cursor_pos(pos),
         searcher(*history, term, HISTORY_SEARCH_TYPE_PREFIX),
         detector(history, term),
-        working_directory(get_working_directory()),
+        working_directory(env_get_pwd_slash()),
         vars(env_vars_snapshot_t::highlighting_keys),
         generation_count(s_generation_count),
         has_tried_reloading(false)
@@ -1328,7 +1451,7 @@ struct autosuggestion_context_t
             this->autosuggestion = special_suggestion;
             return 1;
         }
-        
+
         /* Maybe cancel here */
         if (reader_thread_job_is_stale())
             return 0;
@@ -1511,14 +1634,16 @@ static bool reader_can_replace(const wcstring &in, int flags)
     return true;
 }
 
-/* Compare two completions, except make the case insensitive comes larger than everyone (so they come last) */
-bool case_sensitive_completion_compare(const completion_t &a, const completion_t &b)
+/* Compare two completions, ordering completions with better match types first */
+bool compare_completions_by_match_type(const completion_t &a, const completion_t &b)
 {
-    if (a.is_case_insensitive() != b.is_case_insensitive())
+    /* Compare match types */
+    int match_compare = a.match.compare(b.match);
+    if (match_compare != 0)
     {
-        /* Case insensitive ones come last. Exactly one of a, b is case insensitive. If it's a, return false, i.e. not less than, to make it appear at the end. */
-        return ! a.is_case_insensitive();
+        return match_compare < 0;
     }
+
     /* Compare using file comparison */
     return wcsfilecmp(a.completion.c_str(), b.completion.c_str()) < 0;
 }
@@ -1526,7 +1651,28 @@ bool case_sensitive_completion_compare(const completion_t &a, const completion_t
 /* Order completions such that case insensitive completions come first. */
 static void prioritize_completions(std::vector<completion_t> &comp)
 {
-    sort(comp.begin(), comp.end(), case_sensitive_completion_compare);
+    /* Determine the best match type */
+    size_t i;
+    fuzzy_match_type_t best_type = fuzzy_match_none;
+    for (i=0; i < comp.size(); i++)
+    {
+        const completion_t &el = comp.at(i);
+        if (el.match.type < best_type)
+            best_type = el.match.type;
+    }
+
+    /* Throw out completions whose match types are not the best. */
+    i = comp.size();
+    while (i--)
+    {
+        if (comp.at(i).match.type != best_type)
+        {
+            comp.erase(comp.begin() + i);
+        }
+    }
+
+    /* Sort the remainder */
+    sort(comp.begin(), comp.end(), compare_completions_by_match_type);
 }
 
 /* Given a list of completions, get the completion at an index past *inout_idx, and then increment it. inout_idx should be initialized to (size_t)(-1) for the first call. */
@@ -1552,7 +1698,7 @@ static const completion_t *cycle_competions(const std::vector<completion_t> &com
         const completion_t &c = comp.at(idx);
 
         /* Try this completion */
-        if (! c.is_case_insensitive() || reader_can_replace(command_line, c.flags))
+        if (!(c.flags & COMPLETE_REPLACES_TOKEN) || reader_can_replace(command_line, c.flags))
         {
             /* Success */
             result = &c;
@@ -1586,12 +1732,8 @@ static const completion_t *cycle_competions(const std::vector<completion_t> &com
 
 static bool handle_completions(const std::vector<completion_t> &comp)
 {
-    wchar_t *base = NULL;
-    size_t len = 0;
     bool done = false;
     bool success = false;
-    int count = 0;
-    int flags=0;
     const wchar_t *begin, *end, *buff = data->command_line.c_str();
 
     parse_util_token_extent(buff, data->buff_pos, &begin, 0, 0, 0);
@@ -1625,7 +1767,7 @@ static bool handle_completions(const std::vector<completion_t> &comp)
               the token doesn't contain evil operators
               like {}
              */
-            if (! c.is_case_insensitive() || reader_can_replace(tok, c.flags))
+            if (!(c.flags & COMPLETE_REPLACES_TOKEN) || reader_can_replace(tok, c.flags))
             {
                 completion_insert(c.completion.c_str(), c.flags);
             }
@@ -1638,141 +1780,147 @@ static bool handle_completions(const std::vector<completion_t> &comp)
 
     if (!done)
     {
-        /* Try to find something to insert with the correct case */
-        for (size_t i=0; i< comp.size() ; i++)
-        {
-            const completion_t &c =  comp.at(i);
 
-            /* Ignore case insensitive completions for now */
-            if (c.is_case_insensitive())
+        /* Determine the type of the best match(es) */
+        fuzzy_match_type_t best_match_type = fuzzy_match_none;
+        for (size_t i=0; i < comp.size(); i++)
+        {
+            const completion_t &el = comp.at(i);
+            if (el.match.type < best_match_type)
+            {
+                best_match_type = el.match.type;
+            }
+        }
+
+        /* Determine whether we are going to replace the token or not. If any commands of the best type do not require replacement, then ignore all those that want to use replacement */
+        bool will_replace_token = true;
+        for (size_t i=0; i< comp.size(); i++)
+        {
+            const completion_t &el = comp.at(i);
+            if (el.match.type == best_match_type && !(el.flags & COMPLETE_REPLACES_TOKEN))
+            {
+                will_replace_token = false;
+                break;
+            }
+        }
+
+        /* Decide which completions survived. There may be a lot of them; it would be nice if we could figure out how to avoid copying them here */
+        std::vector<completion_t> surviving_completions;
+        for (size_t i=0; i < comp.size(); i++)
+        {
+            const completion_t &el = comp.at(i);
+            /* Only use completions with the best match type */
+            if (el.match.type != best_match_type)
                 continue;
 
-            count++;
+            /* Only use completions that match replace_token */
+            bool completion_replace_token = !!(el.flags & COMPLETE_REPLACES_TOKEN);
+            if (completion_replace_token != will_replace_token)
+                continue;
 
-            if (base)
+            /* Don't use completions that want to replace, if we cannot replace them */
+            if (completion_replace_token && ! reader_can_replace(tok, el.flags))
+                continue;
+
+            /* This completion survived */
+            surviving_completions.push_back(el);
+        }
+
+
+        /* Try to find a common prefix to insert among the surviving completions */
+        wcstring common_prefix;
+        complete_flags_t flags = 0;
+        bool prefix_is_partial_completion = false;
+        for (size_t i=0; i < surviving_completions.size(); i++)
+        {
+            const completion_t &el = surviving_completions.at(i);
+            if (i == 0)
             {
-                size_t new_len = comp_len(base, c.completion.c_str());
-                len = mini(new_len, len);
+                /* First entry, use the whole string */
+                common_prefix = el.completion;
+                flags = el.flags;
             }
             else
             {
-                base = wcsdup(c.completion.c_str());
-                len = wcslen(base);
-                flags = c.flags;
-            }
-        }
-
-        /* If we found something to insert, do it. */
-        if (len > 0)
-        {
-            if (count > 1)
-                flags = flags | COMPLETE_NO_SPACE;
-
-            base[len]=L'\0';
-            completion_insert(base, flags);
-            done = true;
-            success = true;
-        }
-    }
-
-
-
-    if (!done && base == NULL)
-    {
-        /* Try to find something to insert ignoring case */
-        if (begin)
-        {
-            size_t offset = tok.size();
-
-            count = 0;
-
-            for (size_t i=0; i< comp.size(); i++)
-            {
-                const completion_t &c = comp.at(i);
-
-                if (! c.is_case_insensitive())
-                    continue;
-
-                if (!reader_can_replace(tok, c.flags))
+                /* Determine the shared prefix length. */
+                size_t idx, max = mini(common_prefix.size(), el.completion.size());
+                for (idx=0; idx < max; idx++)
                 {
-                    len=0;
+                    wchar_t ac = common_prefix.at(idx), bc = el.completion.at(idx);
+                    bool matches = (ac == bc);
+                    /* If we are replacing the token, allow case to vary */
+                    if (will_replace_token && ! matches)
+                    {
+                        /* Hackish way to compare two strings in a case insensitive way, hopefully better than towlower(). */
+                        matches = (wcsncasecmp(&ac, &bc, 1) == 0);
+                    }
+                    if (! matches)
+                        break;
+                }
+
+                /* idx is now the length of the new common prefix */
+                common_prefix.resize(idx);
+                prefix_is_partial_completion = true;
+
+                /* Early out if we decide there's no common prefix */
+                if (idx == 0)
                     break;
-                }
-
-                count++;
-
-                if (base)
-                {
-                    size_t new_len = offset + comp_ilen(base+offset, c.completion.c_str()+offset);
-                    len = new_len < len ? new_len: len;
-                }
-                else
-                {
-                    base = wcsdup(c.completion.c_str());
-                    len = wcslen(base);
-                    flags = c.flags;
-
-                }
             }
-
-            if (len > offset)
-            {
-                if (count > 1)
-                    flags = flags | COMPLETE_NO_SPACE;
-
-                base[len]=L'\0';
-                completion_insert(base, flags);
-                done = 1;
-                success = true;
-            }
-
         }
-    }
 
-    free(base);
-
-    if (!done)
-    {
-        /*
-          There is no common prefix in the completions, and show_list
-          is true, so we print the list
-        */
-        size_t len, prefix_start = 0;
-        wcstring prefix;
-        parse_util_get_parameter_info(data->command_line, data->buff_pos, NULL, &prefix_start, NULL);
-
-        assert(data->buff_pos >= prefix_start);
-        len = data->buff_pos - prefix_start;
-
-        if (len <= PREFIX_MAX_LEN)
+        if (! common_prefix.empty())
         {
-            prefix.append(data->command_line, prefix_start, len);
+            /* We got something. If more than one completion contributed, then it means we have a prefix; don't insert a space after it */
+            if (prefix_is_partial_completion)
+                flags |= COMPLETE_NO_SPACE;
+            completion_insert(common_prefix.c_str(), flags);
+            success = true;
         }
         else
         {
-            // append just the end of the string
-            prefix = wcstring(&ellipsis_char, 1);
-            prefix.append(data->command_line, prefix_start + len - PREFIX_MAX_LEN, PREFIX_MAX_LEN);
+            /* We didn't get a common prefix. Print the list. */
+            size_t len, prefix_start = 0;
+            wcstring prefix;
+            parse_util_get_parameter_info(data->command_line, data->buff_pos, NULL, &prefix_start, NULL);
+
+            assert(data->buff_pos >= prefix_start);
+            len = data->buff_pos - prefix_start;
+
+            if (match_type_requires_full_replacement(best_match_type))
+            {
+                // No prefix
+                prefix.clear();
+            }
+            else if (len <= PREFIX_MAX_LEN)
+            {
+                prefix.append(data->command_line, prefix_start, len);
+            }
+            else
+            {
+                // append just the end of the string
+                prefix = wcstring(&ellipsis_char, 1);
+                prefix.append(data->command_line, prefix_start + len - PREFIX_MAX_LEN, PREFIX_MAX_LEN);
+            }
+
+            {
+                int is_quoted;
+
+                wchar_t quote;
+                parse_util_get_parameter_info(data->command_line, data->buff_pos, &quote, NULL, NULL);
+                is_quoted = (quote != L'\0');
+
+                /* Clear the autosuggestion from the old commandline before abandoning it (see #561) */
+                if (! data->autosuggestion.empty())
+                    reader_repaint_without_autosuggestion();
+
+                write_loop(1, "\n", 1);
+
+                run_pager(prefix, is_quoted, surviving_completions);
+            }
+            s_reset(&data->screen, screen_reset_abandon_line);
+            reader_repaint();
+            success = false;
         }
-
-        {
-            int is_quoted;
-
-            wchar_t quote;
-            parse_util_get_parameter_info(data->command_line, data->buff_pos, &quote, NULL, NULL);
-            is_quoted = (quote != L'\0');
-
-            /* Clear the autosuggestion from the old commandline before abandoning it (see #561) */
-            if (! data->autosuggestion.empty())
-                reader_repaint_without_autosuggestion();
-
-            write_loop(1, "\n", 1);
-
-            run_pager(prefix, is_quoted, comp);
-        }
-        s_reset(&data->screen, screen_reset_abandon_line);
-        reader_repaint();
-        success = false;
     }
     return success;
 }
@@ -1994,8 +2142,7 @@ void reader_sanity_check()
 }
 
 /**
-   Set the specified string from the history as the current buffer. Do
-   not modify prefix_width.
+   Set the specified string as the current buffer.
 */
 static void set_command_line_and_position(const wcstring &new_str, size_t pos)
 {
@@ -2476,6 +2623,11 @@ void reader_set_allow_autosuggesting(bool flag)
     data->allow_autosuggestion = flag;
 }
 
+void reader_set_expand_abbreviations(bool flag)
+{
+    data->expand_abbreviations = flag;
+}
+
 void reader_set_complete_function(complete_function_t f)
 {
     data->complete_func = f;
@@ -2726,6 +2878,7 @@ static int read_i(void)
     reader_set_highlight_function(&highlight_shell);
     reader_set_test_function(&reader_shell_test);
     reader_set_allow_autosuggesting(true);
+    reader_set_expand_abbreviations(true);
     reader_import_history_if_necessary();
 
     parser_t &parser = parser_t::principal_parser();
@@ -2865,7 +3018,6 @@ const wchar_t *reader_readline(void)
     data->search_buff.clear();
     data->search_mode = NO_SEARCH;
 
-
     exec_prompt();
 
     reader_super_highlight_me_plenty(data->buff_pos);
@@ -2962,10 +3114,17 @@ const wchar_t *reader_readline(void)
 
             case R_END_OF_LINE:
             {
-                while (buff[data->buff_pos] &&
-                        buff[data->buff_pos] != L'\n')
+                if (data->buff_pos < data->command_length())
                 {
-                    data->buff_pos++;
+                    while (buff[data->buff_pos] &&
+                            buff[data->buff_pos] != L'\n')
+                    {
+                        data->buff_pos++;
+                    }
+                }
+                else
+                {
+                    accept_autosuggestion(true);
                 }
 
                 reader_repaint();
@@ -3035,22 +3194,33 @@ const wchar_t *reader_readline(void)
 
                         /* Since we just inserted a completion, don't immediately do a new autosuggestion */
                         data->suppress_autosuggestion = true;
+
+                        /* Trigger repaint (see #765) */
+                        reader_repaint_if_needed();
                     }
                 }
                 else
                 {
                     /* Either the user hit tab only once, or we had no visible completion list. */
-                    const wchar_t *cmdsub_begin, *cmdsub_end;
-                    const wchar_t *token_begin, *token_end;
+
+                    /* Remove a trailing backslash. This may trigger an extra repaint, but this is rare. */
+                    if (is_backslashed(data->command_line, data->buff_pos))
+                    {
+                        remove_backward();
+                    }
+
+                    /* Get the string; we have to do this after removing any trailing backslash */
                     const wchar_t * const buff = data->command_line.c_str();
 
                     /* Clear the completion list */
                     comp.clear();
 
                     /* Figure out the extent of the command substitution surrounding the cursor. This is because we only look at the current command substitution to form completions - stuff happening outside of it is not interesting. */
+                    const wchar_t *cmdsub_begin, *cmdsub_end;
                     parse_util_cmdsubst_extent(buff, data->buff_pos, &cmdsub_begin, &cmdsub_end);
 
                     /* Figure out the extent of the token within the command substitution. Note we pass cmdsub_begin here, not buff */
+                    const wchar_t *token_begin, *token_end;
                     parse_util_token_extent(cmdsub_begin, data->buff_pos - (cmdsub_begin-buff), &token_begin, &token_end, 0, 0);
 
                     /* Figure out how many steps to get from the current position to the end of the current token. */
@@ -3063,17 +3233,11 @@ const wchar_t *reader_readline(void)
                         reader_repaint();
                     }
 
-                    /* Remove a trailing backslash. This may trigger an extra repaint, but this is rare. */
-                    if (is_backslashed(data->command_line, data->buff_pos))
-                    {
-                        remove_backward();
-                    }
-
                     /* Construct a copy of the string from the beginning of the command substitution up to the end of the token we're completing */
                     const wcstring buffcpy = wcstring(cmdsub_begin, token_end);
 
                     //fprintf(stderr, "Complete (%ls)\n", buffcpy.c_str());
-                    data->complete_func(buffcpy, comp, COMPLETION_REQUEST_DEFAULT | COMPLETION_REQUEST_DESCRIPTIONS, NULL);
+                    data->complete_func(buffcpy, comp, COMPLETION_REQUEST_DEFAULT | COMPLETION_REQUEST_DESCRIPTIONS | COMPLETION_REQUEST_FUZZY_MATCH, NULL);
 
                     /* Munge our completions */
                     sort_and_make_unique(comp);
@@ -3087,7 +3251,7 @@ const wchar_t *reader_readline(void)
 
                     /* Start the cycle at the beginning */
                     completion_cycle_idx = (size_t)(-1);
-                    
+
                     /* Repaint */
                     reader_repaint_if_needed();
                 }
@@ -3270,7 +3434,21 @@ const wchar_t *reader_readline(void)
                     }
                 }
 
-                switch (data->test_func(data->command_line.c_str()))
+                /* See if this command is valid */
+                int command_test_result = data->test_func(data->command_line.c_str());
+                if (command_test_result == 0 || command_test_result == PARSER_TEST_INCOMPLETE)
+                {
+                    /* This command is valid, but an abbreviation may make it invalid. If so, we will have to test again. */
+                    bool abbreviation_expanded = data->expand_abbreviation_as_necessary();
+                    if (abbreviation_expanded)
+                    {
+                        /* It's our reponsibility to rehighlight and repaint. But everything we do below triggers a repaint. */
+                        reader_super_highlight_me_plenty(data->buff_pos);
+                        command_test_result = data->test_func(data->command_line.c_str());
+                    }
+                }
+
+                switch (command_test_result)
                 {
 
                     case 0:
@@ -3537,12 +3715,83 @@ const wchar_t *reader_readline(void)
                 break;
             }
 
+            case R_TRANSPOSE_CHARS:
+            {
+                if (data->command_length() < 2)
+                {
+                    break;
+                }
+
+                /* If the cursor is at the end, transpose the last two characters of the line */
+                if (data->buff_pos == data->command_length())
+                {
+                    data->buff_pos--;
+                }
+
+                /*
+                 Drag the character before the cursor forward over the character at the cursor, moving
+                 the cursor forward as well.
+                 */
+                if (data->buff_pos > 0)
+                {
+                    wcstring local_cmd = data->command_line;
+                    std::swap(local_cmd.at(data->buff_pos), local_cmd.at(data->buff_pos-1));
+                    set_command_line_and_position(local_cmd, data->buff_pos + 1);
+                }
+                break;
+            }
+
+            case R_TRANSPOSE_WORDS:
+            {
+                size_t len = data->command_length();
+                const wchar_t *buff = data->command_line.c_str();
+                const wchar_t *tok_begin, *tok_end, *prev_begin, *prev_end;
+
+                /* If we are not in a token, look for one ahead */
+                while (data->buff_pos != len && !iswalnum(buff[data->buff_pos]))
+                    data->buff_pos++;
+
+                parse_util_token_extent(buff, data->buff_pos, &tok_begin, &tok_end, &prev_begin, &prev_end);
+
+                /* In case we didn't find a token at or after the cursor... */
+                if (tok_begin == &buff[len])
+                {
+                    /* ...retry beginning from the previous token */
+                    size_t pos = prev_end - &buff[0];
+                    parse_util_token_extent(buff, pos, &tok_begin, &tok_end, &prev_begin, &prev_end);
+                }
+
+                /* Make sure we have two tokens */
+                if (prev_begin < prev_end && tok_begin < tok_end && tok_begin > prev_begin)
+                {
+                    const wcstring prev(prev_begin, prev_end - prev_begin);
+                    const wcstring sep(prev_end, tok_begin - prev_end);
+                    const wcstring tok(tok_begin, tok_end - tok_begin);
+                    const wcstring trail(tok_end, &buff[len] - tok_end);
+
+                    /* Compose new command line with swapped tokens */
+                    wcstring new_buff(buff, prev_begin - buff);
+                    new_buff.append(tok);
+                    new_buff.append(sep);
+                    new_buff.append(prev);
+                    new_buff.append(trail);
+                    /* Put cursor right after the second token */
+                    set_command_line_and_position(new_buff, tok_end - buff);
+                }
+                break;
+            }
+
             /* Other, if a normal character, we add it to the command */
             default:
             {
-
                 if ((!wchar_private(c)) && (((c>31) || (c==L'\n'))&& (c != 127)))
                 {
+                    /* Expand abbreviations on space */
+                    if (c == L' ')
+                    {
+                        data->expand_abbreviation_as_necessary();
+                    }
+
                     /* Regular character */
                     insert_char(c);
                 }
@@ -3576,10 +3825,7 @@ const wchar_t *reader_readline(void)
     }
 
     writestr(L"\n");
-    /*
-     if( comp )
-     halloc_free( comp );
-     */
+
     if (!reader_exit_forced())
     {
         if (tcsetattr(0,TCSANOW,&old_modes))      /* return to previous mode */

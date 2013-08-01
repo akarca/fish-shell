@@ -214,7 +214,7 @@ wcstring builtin_help_get(parser_t &parser, const wchar_t *name)
     /* This won't ever work if no_exec is set */
     if (no_exec)
         return wcstring();
-    
+
     wcstring_list_t lst;
     wcstring out;
     const wcstring name_esc = escape_string(name, 1);
@@ -1658,7 +1658,7 @@ static int builtin_echo(parser_t &parser, wchar_t **argv)
                         wc = L'\b';
                         break;
                     case L'e':
-                        wc = L'\e';
+                        wc = L'\x1B';
                         break;
                     case L'f':
                         wc = L'\f';
@@ -2370,8 +2370,9 @@ static int builtin_read(parser_t &parser, wchar_t **argv)
             reader_set_highlight_function(&highlight_shell);
             reader_set_test_function(&reader_shell_test);
         }
-        /* No autosuggestions in builtin_read */
+        /* No autosuggestions or abbreviations in builtin_read */
         reader_set_allow_autosuggesting(false);
+        reader_set_expand_abbreviations(false);
         reader_set_exit_on_interrupt(true);
 
         reader_set_buffer(commandline, wcslen(commandline));
@@ -2904,28 +2905,17 @@ static int builtin_contains(parser_t &parser, wchar_t ** argv)
 {
     int argc;
     argc = builtin_count_args(argv);
-    int i;
     wchar_t *needle;
-    int index=0;
+    bool should_output_index = false;
 
     woptind=0;
 
-    const struct woption
-            long_options[] =
+    const struct woption long_options[] =
     {
-        {
-            L"help", no_argument, 0, 'h'
-        }
-        ,
-        {
-            L"index", no_argument, 0, 'i'
-        }
-        ,
-        {
-            0, 0, 0, 0
-        }
-    }
-    ;
+        { L"help", no_argument, 0, 'h' } ,
+        { L"index", no_argument, 0, 'i' },
+        { 0, 0, 0, 0 }
+    };
 
     while (1)
     {
@@ -2967,13 +2957,11 @@ static int builtin_contains(parser_t &parser, wchar_t ** argv)
                 return STATUS_BUILTIN_ERROR;
 
             case 'i':
-                index=1;
+                should_output_index = true;
                 break;
         }
 
     }
-
-
 
     needle = argv[woptind];
     if (!needle)
@@ -2982,12 +2970,12 @@ static int builtin_contains(parser_t &parser, wchar_t ** argv)
     }
 
 
-    for (i=woptind+1; i<argc; i++)
+    for (int i=woptind+1; i<argc; i++)
     {
 
         if (!wcscmp(needle, argv[i]))
         {
-            if (index) append_format(stdout_buffer, L"%d\n", i-woptind);
+            if (should_output_index) append_format(stdout_buffer, L"%d\n", i-woptind);
             return 0;
         }
     }

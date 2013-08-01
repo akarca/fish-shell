@@ -18,7 +18,9 @@ parameter expansion.
 #include <limits.h>
 #include <sys/param.h>
 #include <sys/types.h>
+#ifdef HAVE_SYS_SYSCTL_H
 #include <sys/sysctl.h>
+#endif
 #include <termios.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1334,10 +1336,7 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
     const wchar_t * const in = input.c_str();
 
     int parse_ret;
-    switch (parse_ret = parse_util_locate_cmdsubst(in,
-                        &paran_begin,
-                        &paran_end,
-                        0))
+    switch (parse_ret = parse_util_locate_cmdsubst(in, &paran_begin, &paran_end, false))
     {
         case -1:
             parser.error(SYNTAX_ERROR,
@@ -1490,7 +1489,7 @@ static void expand_home_directory(wcstring &input)
     {
         size_t tail_idx;
         wcstring username = get_home_directory_name(input, &tail_idx);
-        
+
         bool tilde_error = false;
         wcstring home;
         if (username.empty())
@@ -1539,7 +1538,7 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
     // If it does not, there's nothing to do
     if (input.empty() || input.at(0) != L'~')
         return;
-    
+
     // We only operate on completions that replace their contents
     // If we don't have any, we're done.
     // In particular, empty vectors are common.
@@ -1554,15 +1553,15 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
     }
     if (! has_candidate_completion)
         return;
-    
+
     size_t tail_idx;
     wcstring username_with_tilde = L"~";
     username_with_tilde.append(get_home_directory_name(input, &tail_idx));
-    
+
     // Expand username_with_tilde
     wcstring home = username_with_tilde;
     expand_tilde(home);
-    
+
     // Now for each completion that starts with home, replace it with the username_with_tilde
     for (size_t i=0; i < completions->size(); i++)
     {
@@ -1570,7 +1569,7 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
         if ((comp.flags & COMPLETE_REPLACES_TOKEN) && string_prefixes_string(home, comp.completion))
         {
             comp.completion.replace(0, home.size(), username_with_tilde);
-            
+
             // And mark that our tilde is literal, so it doesn't try to escape it
             comp.flags |= COMPLETE_DONT_ESCAPE_TILDES;
         }
@@ -1607,29 +1606,18 @@ static void remove_internal_separator(wcstring &str, bool conv)
 
 
 int expand_string(const wcstring &input, std::vector<completion_t> &output, expand_flags_t flags)
-{    
+{
     parser_t parser(PARSER_TYPE_ERRORS_ONLY, true /* show errors */);
-    
+
     size_t i;
     int res = EXPAND_OK;
-
-    /* Make the empty string handling behavior explicit. It's a little weird, but expand_one depends on this. */
-    if (input.empty())
-    {
-        /* Return OK. But only append a completion if ACCEPT_INCOMPLETE is not set. */
-        if (! (flags & ACCEPT_INCOMPLETE))
-        {
-            output.push_back(completion_t(input));
-        }
-        return EXPAND_OK;
-    }
 
     if ((!(flags & ACCEPT_INCOMPLETE)) && expand_is_clean(input.c_str()))
     {
         output.push_back(completion_t(input));
         return EXPAND_OK;
     }
-    
+
     std::vector<completion_t> clist1, clist2;
     std::vector<completion_t> *in = &clist1, *out = &clist2;
 
@@ -1637,10 +1625,7 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
     {
         wchar_t *begin, *end;
 
-        if (parse_util_locate_cmdsubst(input.c_str(),
-                                       &begin,
-                                       &end,
-                                       1) != 0)
+        if (parse_util_locate_cmdsubst(input.c_str(), &begin, &end, true) != 0)
         {
             parser.error(CMDSUBST_ERROR, -1, L"Command substitutions not allowed");
             return EXPAND_ERROR;
@@ -1653,7 +1638,7 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
         if (! cmdsubst_ok)
             return EXPAND_ERROR;
     }
-    
+
     for (i=0; i < in->size(); i++)
     {
         /*
@@ -1796,19 +1781,19 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
         }
         else
         {
-            if (! (flags & ACCEPT_INCOMPLETE))
+            if (!(flags & ACCEPT_INCOMPLETE))
             {
                 out->push_back(completion_t(next_str));
             }
         }
     }
-    
+
     // Hack to un-expand tildes (see #647)
-    if (! (flags & EXPAND_SKIP_HOME_DIRECTORIES))
+    if (!(flags & EXPAND_SKIP_HOME_DIRECTORIES))
     {
         unexpand_tildes(input, out);
     }
-    
+
     // Return our output
     output.insert(output.end(), out->begin(), out->end());
 
@@ -1944,6 +1929,45 @@ bool fish_openSUSE_dbus_hack_hack_hack_hack(std::vector<completion_t> *args)
                     result = true;
                 }
             }
+        }
+    }
+    return result;
+}
+
+bool expand_abbreviation(const wcstring &src, wcstring *output)
+{
+    if (src.empty())
+        return false;
+
+    /* Get the abbreviations. Return false if we have none */
+    env_var_t var = env_get_string(USER_ABBREVIATIONS_VARIABLE_NAME);
+    if (var.missing_or_empty())
+        return false;
+
+    bool result = false;
+    wcstring line;
+    wcstokenizer tokenizer(var, ARRAY_SEP_STR);
+    while (tokenizer.next(line))
+    {
+        /* Line is expected to be of the form 'foo=bar'. Parse out the first =. Be forgiving about spaces, but silently skip on failure (no equals, or equals at the end or beginning). Try to avoid copying any strings until we are sure this is a match. */
+        size_t equals = line.find(L'=');
+        if (equals == wcstring::npos || equals == 0 || equals + 1 == line.size())
+            continue;
+
+        /* Find the character just past the end of the command. Walk backwards, skipping spaces. */
+        size_t cmd_end = equals;
+        while (cmd_end > 0 && iswspace(line.at(cmd_end - 1)))
+            cmd_end--;
+
+        /* See if this command matches */
+        if (line.compare(0, cmd_end, src) == 0)
+        {
+            /* Success. Set output to everythign past the end of the string. */
+            if (output != NULL)
+                output->assign(line, equals + 1, wcstring::npos);
+
+            result = true;
+            break;
         }
     }
     return result;

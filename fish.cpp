@@ -202,7 +202,7 @@ static struct config_paths_t determine_config_directory_paths(const char *argv0)
         paths.data = L"" DATADIR "/fish";
         paths.sysconf = L"" SYSCONFDIR "/fish";
         paths.doc = L"" DATADIR "/doc/fish";
-        paths.bin = L"" PREFIX "/bin";
+        paths.bin = L"" BINDIR;
 
         done = true;
     }
@@ -382,36 +382,6 @@ static int fish_parse_opt(int argc, char **argv, std::vector<std::string> *out_c
     return my_optind;
 }
 
-/**
-   Calls a bunch of init functions, parses the init files and then
-   parses commands from stdin or files, depending on arguments
-*/
-
-static wcstring full_escape(const wchar_t *in)
-{
-    wcstring out;
-    for (; *in; in++)
-    {
-        if (*in < 32)
-        {
-            append_format(out, L"\\x%.2x", *in);
-        }
-        else if (*in < 128)
-        {
-            out.push_back(*in);
-        }
-        else if (*in < 65536)
-        {
-            append_format(out, L"\\u%.4x", *in);
-        }
-        else
-        {
-            append_format(out, L"\\U%.8x", *in);
-        }
-    }
-    return out;
-}
-
 extern int g_fork_count;
 int main(int argc, char **argv)
 {
@@ -462,7 +432,7 @@ int main(int argc, char **argv)
     {
         /* Stop the exit status of any initialization commands (#635) */
         proc_set_last_status(STATUS_BUILTIN_OK);
-        
+
         /* Run the commands specified as arguments, if any */
         if (! cmds.empty())
         {
@@ -554,5 +524,6 @@ int main(int argc, char **argv)
     if (g_log_forks)
         printf("%d: g_fork_count: %d\n", __LINE__, g_fork_count);
 
-    return res?STATUS_UNKNOWN_COMMAND:proc_get_last_status();
+    exit_without_destructors(res ? STATUS_UNKNOWN_COMMAND : proc_get_last_status());
+    return EXIT_FAILURE; //above line should always exit
 }

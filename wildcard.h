@@ -18,6 +18,7 @@
 #include "util.h"
 #include "common.h"
 #include "expand.h"
+#include "complete.h"
 
 /*
   Use unencoded private-use keycodes for internal characters
@@ -73,15 +74,14 @@ int wildcard_expand_string(const wcstring &wc, const wcstring &base_dir, expand_
 
    \param str The string to test
    \param wc The wildcard to test against
+   \param leading_dots_fail_to_match if set, strings with leading dots are assumed to be hidden files and are not matched
    \return true if the wildcard matched
 */
-bool wildcard_match(const wcstring &str, const wcstring &wc);
+bool wildcard_match(const wcstring &str, const wcstring &wc, bool leading_dots_fail_to_match = false);
 
 
-/**
-   Check if the specified string contains wildcards
-*/
-int wildcard_has(const wchar_t *str, int internal);
+/** Check if the specified string contains wildcards */
+bool wildcard_has(const wchar_t *str, bool internal);
 
 /**
    Test wildcard completion
@@ -91,6 +91,7 @@ bool wildcard_complete(const wcstring &str,
                        const wchar_t *desc,
                        wcstring(*desc_func)(const wcstring &),
                        std::vector<completion_t> &out,
-                       expand_flags_t flags);
+                       expand_flags_t expand_flags,
+                       complete_flags_t flags);
 
 #endif

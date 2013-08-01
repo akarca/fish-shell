@@ -106,12 +106,12 @@ wildcards using **.
 static std::map<wcstring, wcstring> suffix_map;
 
 
-int wildcard_has(const wchar_t *str, int internal)
+bool wildcard_has(const wchar_t *str, bool internal)
 {
     if (!str)
     {
         debug(2, L"Got null string on line %d of file %s", __LINE__, __FILE__);
-        return 0;
+        return false;
     }
 
     if (internal)
@@ -119,7 +119,7 @@ int wildcard_has(const wchar_t *str, int internal)
         for (; *str; str++)
         {
             if ((*str == ANY_CHAR) || (*str == ANY_STRING) || (*str == ANY_STRING_RECURSIVE))
-                return 1;
+                return true;
         }
     }
     else
@@ -128,12 +128,12 @@ int wildcard_has(const wchar_t *str, int internal)
         for (; *str; str++)
         {
             if (((*str == L'*') || (*str == L'?')) && (prev != L'\\'))
-                return 1;
+                return true;
             prev = *str;
         }
     }
 
-    return 0;
+    return false;
 }
 
 /**
@@ -143,15 +143,13 @@ int wildcard_has(const wchar_t *str, int internal)
    \param wc The wildcard.
    \param is_first Whether files beginning with dots should not be matched against wildcards.
 */
-static bool wildcard_match2(const wchar_t *str,
-                            const wchar_t *wc,
-                            bool is_first)
+static bool wildcard_match_internal(const wchar_t *str, const wchar_t *wc, bool leading_dots_fail_to_match, bool is_first)
 {
     if (*str == 0 && *wc==0)
         return true;
 
-    /* Hackish fix for https://github.com/fish-shell/fish-shell/issues/270. Prevent wildcards from matching . or .., but we must still allow literal matches. */
-    if (is_first && contains(str, L".", L".."))
+    /* Hackish fix for https://github.com/fish-shell/fish-shell/issues/270 . Prevent wildcards from matching . or .., but we must still allow literal matches. */
+    if (leading_dots_fail_to_match && is_first && contains(str, L".", L".."))
     {
         /* The string is '.' or '..'. Return true if the wildcard exactly matches. */
         return ! wcscmp(str, wc);
@@ -160,7 +158,7 @@ static bool wildcard_match2(const wchar_t *str,
     if (*wc == ANY_STRING || *wc == ANY_STRING_RECURSIVE)
     {
         /* Ignore hidden file */
-        if (is_first && *str == L'.')
+        if (leading_dots_fail_to_match && is_first && *str == L'.')
         {
             return false;
         }
@@ -168,7 +166,7 @@ static bool wildcard_match2(const wchar_t *str,
         /* Try all submatches */
         do
         {
-            if (wildcard_match2(str, wc+1, false))
+            if (wildcard_match_internal(str, wc+1, leading_dots_fail_to_match, false))
                 return true;
         }
         while (*(str++) != 0);
@@ -190,11 +188,11 @@ static bool wildcard_match2(const wchar_t *str,
             return false;
         }
 
-        return wildcard_match2(str+1, wc+1, false);
+        return wildcard_match_internal(str+1, wc+1, leading_dots_fail_to_match, false);
     }
 
     if (*wc == *str)
-        return wildcard_match2(str+1, wc+1, false);
+        return wildcard_match_internal(str+1, wc+1, leading_dots_fail_to_match, false);
 
     return false;
 }
@@ -211,7 +209,8 @@ static bool wildcard_complete_internal(const wcstring &orig,
                                        const wchar_t *desc,
                                        wcstring(*desc_func)(const wcstring &),
                                        std::vector<completion_t> &out,
-                                       int flags)
+                                       expand_flags_t expand_flags,
+                                       complete_flags_t flags)
 {
     if (!wc || ! str || orig.empty())
     {
@@ -219,20 +218,60 @@ static bool wildcard_complete_internal(const wcstring &orig,
         return 0;
     }
 
-    if (*wc == 0 &&
-            ((str[0] != L'.') || (!is_first)))
-    {
-        wcstring out_completion;
-        wcstring out_desc = (desc ? desc : L"");
+    bool has_match = false;
+    string_fuzzy_match_t fuzzy_match(fuzzy_match_exact);
+    const bool at_end_of_wildcard = (*wc == L'\0');
+    const wchar_t *completion_string = NULL;
 
-        if (flags & COMPLETE_REPLACES_TOKEN)
+    // Hack hack hack
+    // Implement EXPAND_FUZZY_MATCH by short-circuiting everything if there are no remaining wildcards
+    if ((expand_flags & EXPAND_FUZZY_MATCH) && ! at_end_of_wildcard && ! wildcard_has(wc, true))
+    {
+        fuzzy_match = string_fuzzy_match_string(wc, str);
+        if (fuzzy_match.type != fuzzy_match_none)
         {
-            out_completion = orig;
+            has_match = true;
+
+            /* If we're not a prefix or exact match, then we need to replace the token. Note that in this case we're not going to call ourselves recursively, so these modified flags won't "leak" except into the completion. */
+            if (match_type_requires_full_replacement(fuzzy_match.type))
+            {
+                flags |= COMPLETE_REPLACES_TOKEN;
+                completion_string = orig.c_str();
+            }
+            else
+            {
+                /* Since we are not replacing the token, be careful to only store the part of the string after the wildcard */
+                size_t wc_len = wcslen(wc);
+                assert(wcslen(str) >= wc_len);
+                completion_string = str + wcslen(wc);
+            }
         }
-        else
+    }
+
+    /* Maybe we satisfied the wildcard normally */
+    if (! has_match)
+    {
+        bool file_has_leading_dot = (is_first && str[0] == L'.');
+        if (at_end_of_wildcard && ! file_has_leading_dot)
         {
-            out_completion = str;
+            has_match = true;
+            if (flags & COMPLETE_REPLACES_TOKEN)
+            {
+                completion_string = orig.c_str();
+            }
+            else
+            {
+                completion_string = str;
+            }
         }
+    }
+
+    if (has_match)
+    {
+        /* Wildcard complete */
+        assert(completion_string != NULL);
+        wcstring out_completion = completion_string;
+        wcstring out_desc = (desc ? desc : L"");
 
         size_t complete_sep_loc = out_completion.find(PROG_COMPLETE_SEP);
         if (complete_sep_loc != wcstring::npos)
@@ -243,7 +282,7 @@ static bool wildcard_complete_internal(const wcstring &orig,
         }
         else
         {
-            if (desc_func)
+            if (desc_func && !(expand_flags & EXPAND_NO_DESCRIPTIONS))
             {
                 /*
                   A description generating function is specified, call
@@ -258,10 +297,9 @@ static bool wildcard_complete_internal(const wcstring &orig,
         }
 
         /* Note: out_completion may be empty if the completion really is empty, e.g. tab-completing 'foo' when a file 'foo' exists. */
-        append_completion(out, out_completion, out_desc, flags);
+        append_completion(out, out_completion, out_desc, flags, fuzzy_match);
         return true;
     }
-
 
     if (*wc == ANY_STRING)
     {
@@ -274,7 +312,7 @@ static bool wildcard_complete_internal(const wcstring &orig,
         /* Try all submatches */
         do
         {
-            res = wildcard_complete_internal(orig, str, wc+1, 0, desc, desc_func, out, flags);
+            res = wildcard_complete_internal(orig, str, wc+1, 0, desc, desc_func, out, expand_flags, flags);
             if (res)
                 break;
         }
@@ -282,17 +320,13 @@ static bool wildcard_complete_internal(const wcstring &orig,
         return res;
 
     }
-    else if (*wc == ANY_CHAR)
+    else if (*wc == ANY_CHAR || *wc == *str)
     {
-        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, flags);
-    }
-    else if (*wc == *str)
-    {
-        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, flags);
+        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, expand_flags, flags);
     }
     else if (towlower(*wc) == towlower(*str))
     {
-        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, flags | COMPLETE_CASE_INSENSITIVE | COMPLETE_REPLACES_TOKEN);
+        return wildcard_complete_internal(orig, str+1, wc+1, 0, desc, desc_func, out, expand_flags, flags | COMPLETE_REPLACES_TOKEN);
     }
     return false;
 }
@@ -302,17 +336,18 @@ bool wildcard_complete(const wcstring &str,
                        const wchar_t *desc,
                        wcstring(*desc_func)(const wcstring &),
                        std::vector<completion_t> &out,
-                       int flags)
+                       expand_flags_t expand_flags,
+                       complete_flags_t flags)
 {
     bool res;
-    res =  wildcard_complete_internal(str, str.c_str(), wc, true, desc, desc_func, out, flags);
+    res =  wildcard_complete_internal(str, str.c_str(), wc, true, desc, desc_func, out, expand_flags, flags);
     return res;
 }
 
 
-bool wildcard_match(const wcstring &str, const wcstring &wc)
+bool wildcard_match(const wcstring &str, const wcstring &wc, bool leading_dots_fail_to_match)
 {
-    return wildcard_match2(str.c_str(), wc.c_str(), true);
+    return wildcard_match_internal(str.c_str(), wc.c_str(), leading_dots_fail_to_match, true /* first */);
 }
 
 /**
@@ -624,7 +659,7 @@ static void wildcard_completion_allocate(std::vector<completion_t> &list,
 
     if (sz >= 0 && S_ISDIR(buf.st_mode))
     {
-        flags = flags | COMPLETE_NO_SPACE;
+        flags |= COMPLETE_NO_SPACE;
         munged_completion = completion;
         munged_completion.push_back(L'/');
         if (wants_desc)
@@ -644,7 +679,7 @@ static void wildcard_completion_allocate(std::vector<completion_t> &list,
     }
 
     const wcstring &completion_to_use = munged_completion.empty() ? completion : munged_completion;
-    wildcard_complete(completion_to_use, wc, sb.c_str(), NULL, list, flags);
+    wildcard_complete(completion_to_use, wc, sb.c_str(), NULL, list, expand_flags, flags);
 }
 
 /**
@@ -652,20 +687,19 @@ static void wildcard_completion_allocate(std::vector<completion_t> &list,
   expansion flags specified. flags can be a combination of
   EXECUTABLES_ONLY and DIRECTORIES_ONLY.
 */
-static int test_flags(const wchar_t *filename,
-                      int flags)
+static bool test_flags(const wchar_t *filename, expand_flags_t flags)
 {
     if (flags & DIRECTORIES_ONLY)
     {
         struct stat buf;
         if (wstat(filename, &buf) == -1)
         {
-            return 0;
+            return false;
         }
 
         if (!S_ISDIR(buf.st_mode))
         {
-            return 0;
+            return false;
         }
     }
 
@@ -673,10 +707,10 @@ static int test_flags(const wchar_t *filename,
     if (flags & EXECUTABLES_ONLY)
     {
         if (waccess(filename, X_OK) != 0)
-            return 0;
+            return false;
     }
 
-    return 1;
+    return true;
 }
 
 /** Appends a completion to the completion list, if the string is missing from the set. */
@@ -699,24 +733,18 @@ static void insert_completion_if_missing(const wcstring &str, std::vector<comple
    which would be too expensive to construct for all substrings.
  */
 static int wildcard_expand_internal(const wchar_t *wc,
-                                    const wchar_t *base_dir,
+                                    const wchar_t * const base_dir,
                                     expand_flags_t flags,
                                     std::vector<completion_t> &out,
                                     std::set<wcstring> &completion_set,
                                     std::set<file_id_t> &visited_files)
 {
 
-    /* Points to the end of the current wildcard segment */
-    const wchar_t *wc_end;
-
     /* Variables for traversing a directory */
     DIR *dir;
 
     /* The result returned */
     int res = 0;
-
-    /* Length of the directory to search in */
-    size_t base_len;
 
     /* Variables for testing for presense of recursive wildcards */
     const wchar_t *wc_recursive;
@@ -738,13 +766,15 @@ static int wildcard_expand_internal(const wchar_t *wc,
         return 0;
     }
 
+    const size_t base_dir_len = wcslen(base_dir);
+
     if (flags & ACCEPT_INCOMPLETE)
     {
         /*
            Avoid excessive number of returned matches for wc ending with a *
         */
         size_t len = wcslen(wc);
-        if (len && (wc[len-1]==ANY_STRING))
+        if (len > 0 && (wc[len-1]==ANY_STRING))
         {
             wchar_t * foo = wcsdup(wc);
             foo[len-1]=0;
@@ -754,19 +784,17 @@ static int wildcard_expand_internal(const wchar_t *wc,
         }
     }
 
-    /*
-      Initialize various variables
-    */
+    /* Initialize various variables */
 
-    dir_string = base_dir[0]==L'\0'?L".":base_dir;
+    dir_string = (base_dir[0] == L'\0') ? L"." : base_dir;
 
     if (!(dir = wopendir(dir_string)))
     {
         return 0;
     }
 
-    wc_end = wcschr(wc,L'/');
-    base_len = wcslen(base_dir);
+    /* Points to the end of the current wildcard segment */
+    const wchar_t * const wc_end = wcschr(wc,L'/');
 
     /*
       Test for recursive match string in current segment
@@ -801,11 +829,7 @@ static int wildcard_expand_internal(const wchar_t *wc,
 
                         if (test_flags(long_name.c_str(), flags))
                         {
-                            wildcard_completion_allocate(out,
-                                                         long_name,
-                                                         next,
-                                                         L"",
-                                                         flags);
+                            wildcard_completion_allocate(out, long_name, next, L"", flags);
                         }
                     }
                 }
@@ -818,45 +842,31 @@ static int wildcard_expand_internal(const wchar_t *wc,
         }
         else
         {
-            /*
-              This is the last wildcard segment, and it is not empty. Match files/directories.
-            */
-            wcstring next;
-            while (wreaddir(dir, next))
+            /* This is the last wildcard segment, and it is not empty. Match files/directories. */
+            wcstring name_str;
+            while (wreaddir(dir, name_str))
             {
-                const wchar_t * const name = next.c_str();
                 if (flags & ACCEPT_INCOMPLETE)
                 {
 
-                    const wcstring long_name = make_path(base_dir, next);
+                    const wcstring long_name = make_path(base_dir, name_str);
 
-                    /*
-                      Test for matches before stating file, so as to minimize the number of calls to the much slower stat function
-                    */
+                    /* Test for matches before stating file, so as to minimize the number of calls to the much slower stat function. The only expand flag we care about is EXPAND_FUZZY_MATCH; we have no complete flags. */
                     std::vector<completion_t> test;
-                    if (wildcard_complete(name,
-                                          wc,
-                                          L"",
-                                          0,
-                                          test,
-                                          0))
+                    if (wildcard_complete(name_str, wc, L"", NULL, test, flags & EXPAND_FUZZY_MATCH, 0))
                     {
                         if (test_flags(long_name.c_str(), flags))
                         {
-                            wildcard_completion_allocate(out,
-                                                         long_name,
-                                                         name,
-                                                         wc,
-                                                         flags);
+                            wildcard_completion_allocate(out, long_name, name_str, wc, flags);
 
                         }
                     }
                 }
                 else
                 {
-                    if (wildcard_match2(name, wc, true))
+                    if (wildcard_match(name_str, wc, true /* skip files with leading dots */))
                     {
-                        const wcstring long_name = make_path(base_dir, next);
+                        const wcstring long_name = make_path(base_dir, name_str);
                         int skip = 0;
 
                         if (is_recursive)
@@ -891,65 +901,28 @@ static int wildcard_expand_internal(const wchar_t *wc,
         */
 
         /*
-          wc_str is the part of the wildcarded string from the
-          beginning to the first slash
-        */
-        wchar_t *wc_str;
-
-        /*
-          new_dir is a scratch area containing the full path to a
-          file/directory we are iterating over
-        */
-        wchar_t *new_dir;
-
-        /*
-          The maximum length of a file element
-        */
-        long ln=MAX_FILE_LENGTH;
-        char * narrow_dir_string = wcs2str(dir_string);
-
-        /*
           In recursive mode, we look through the directory twice. If
           so, this rewind is needed.
         */
         rewinddir(dir);
 
-        if (narrow_dir_string)
+        /*
+          wc_str is the part of the wildcarded string from the
+          beginning to the first slash
+        */
+        const wcstring wc_str = wcstring(wc, wc_end ? wc_end - wc : wcslen(wc));
+
+        /* new_dir is a scratch area containing the full path to a file/directory we are iterating over */
+        wcstring new_dir = base_dir;
+
+        wcstring name_str;
+        while (wreaddir(dir, name_str))
         {
-            /*
-               Find out how long the filename can be in a worst case
-               scenario
-            */
-            ln = pathconf(narrow_dir_string, _PC_NAME_MAX);
-
-            /*
-              If not specified, use som large number as fallback
-            */
-            if (ln < 0)
-                ln = MAX_FILE_LENGTH;
-            free(narrow_dir_string);
-        }
-        new_dir= (wchar_t *)malloc(sizeof(wchar_t)*(base_len+ln+2));
-
-        wc_str = wc_end?wcsndup(wc, wc_end-wc):wcsdup(wc);
-
-        if ((!new_dir) || (!wc_str))
-        {
-            DIE_MEM();
-        }
-
-        wcscpy(new_dir, base_dir);
-
-        wcstring next;
-        while (wreaddir(dir, next))
-        {
-            const wchar_t *name = next.c_str();
-
             /*
               Test if the file/directory name matches the whole
               wildcard element, i.e. regular matching.
             */
-            int whole_match = wildcard_match2(name, wc_str, true);
+            int whole_match = wildcard_match(name_str, wc_str, true /* ignore leading dots */);
             int partial_match = 0;
 
             /*
@@ -962,100 +935,90 @@ static int wildcard_expand_internal(const wchar_t *wc,
             {
                 const wchar_t *end = wcschr(wc, ANY_STRING_RECURSIVE);
                 wchar_t *wc_sub = wcsndup(wc, end-wc+1);
-                partial_match = wildcard_match2(name, wc_sub, true);
+                partial_match = wildcard_match(name_str, wc_sub, true /* ignore leading dots */);
                 free(wc_sub);
             }
 
             if (whole_match || partial_match)
             {
                 struct stat buf;
-                char *dir_str;
-                int stat_res;
                 int new_res;
 
-                wcscpy(&new_dir[base_len], name);
-                dir_str = wcs2str(new_dir);
+                // new_dir is base_dir + some other path components
+                // Replace everything after base_dir with the new path component
+                new_dir.replace(base_dir_len, wcstring::npos, name_str);
 
-                if (dir_str)
+                int stat_res = wstat(new_dir, &buf);
+
+                if (!stat_res)
                 {
-                    stat_res = stat(dir_str, &buf);
-                    free(dir_str);
-
-                    if (!stat_res)
+                    // Insert a "file ID" into visited_files
+                    // If the insertion fails, we've already visited this file (i.e. a symlink loop)
+                    // If we're not recursive, insert anyways (in case we loop back around in a future recursive segment), but continue on; the idea being that literal path components should still work
+                    const file_id_t file_id(buf.st_dev, buf.st_ino);
+                    if (S_ISDIR(buf.st_mode) && (visited_files.insert(file_id).second || ! is_recursive))
                     {
-                        // Insert a "file ID" into visited_files
-                        // If the insertion fails, we've already visited this file (i.e. a symlink loop)
-                        // If we're not recursive, insert anyways (in case we loop back around in a future recursive segment), but continue on; the idea being that literal path components should still work
-                        const file_id_t file_id(buf.st_dev, buf.st_ino);
-                        if (S_ISDIR(buf.st_mode) && (visited_files.insert(file_id).second || ! is_recursive))
+                        new_dir.push_back(L'/');
+
+                        /*
+                          Regular matching
+                        */
+                        if (whole_match)
                         {
-                            size_t new_len = wcslen(new_dir);
-                            new_dir[new_len] = L'/';
-                            new_dir[new_len+1] = L'\0';
-
-                            /*
-                              Regular matching
-                            */
-                            if (whole_match)
+                            const wchar_t *new_wc = L"";
+                            if (wc_end)
                             {
-                                const wchar_t *new_wc = L"";
-                                if (wc_end)
+                                new_wc=wc_end+1;
+                                /*
+                                  Accept multiple '/' as a single direcotry separator
+                                */
+                                while (*new_wc==L'/')
                                 {
-                                    new_wc=wc_end+1;
-                                    /*
-                                      Accept multiple '/' as a single direcotry separator
-                                    */
-                                    while (*new_wc==L'/')
-                                    {
-                                        new_wc++;
-                                    }
+                                    new_wc++;
                                 }
-
-                                new_res = wildcard_expand_internal(new_wc,
-                                                                   new_dir,
-                                                                   flags,
-                                                                   out,
-                                                                   completion_set,
-                                                                   visited_files);
-
-                                if (new_res == -1)
-                                {
-                                    res = -1;
-                                    break;
-                                }
-                                res |= new_res;
-
                             }
 
-                            /*
-                              Recursive matching
-                            */
-                            if (partial_match)
+                            new_res = wildcard_expand_internal(new_wc,
+                                                               new_dir.c_str(),
+                                                               flags,
+                                                               out,
+                                                               completion_set,
+                                                               visited_files);
+
+                            if (new_res == -1)
                             {
-
-                                new_res = wildcard_expand_internal(wcschr(wc, ANY_STRING_RECURSIVE),
-                                                                   new_dir,
-                                                                   flags | WILDCARD_RECURSIVE,
-                                                                   out,
-                                                                   completion_set,
-                                                                   visited_files);
-
-                                if (new_res == -1)
-                                {
-                                    res = -1;
-                                    break;
-                                }
-                                res |= new_res;
-
+                                res = -1;
+                                break;
                             }
+                            res |= new_res;
+
+                        }
+
+                        /*
+                          Recursive matching
+                        */
+                        if (partial_match)
+                        {
+
+                            new_res = wildcard_expand_internal(wcschr(wc, ANY_STRING_RECURSIVE),
+                                                               new_dir.c_str(),
+                                                               flags | WILDCARD_RECURSIVE,
+                                                               out,
+                                                               completion_set,
+                                                               visited_files);
+
+                            if (new_res == -1)
+                            {
+                                res = -1;
+                                break;
+                            }
+                            res |= new_res;
+
                         }
                     }
                 }
             }
         }
-
-        free(wc_str);
-        free(new_dir);
     }
     closedir(dir);
 
