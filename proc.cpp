@@ -106,6 +106,7 @@ job_iterator_t::job_iterator_t(job_list_t &jobs) : job_list(&jobs)
 
 job_iterator_t::job_iterator_t() : job_list(&parser_t::principal_parser().job_list())
 {
+    ASSERT_IS_MAIN_THREAD();
     this->reset();
 }
 
@@ -135,7 +136,9 @@ static bool proc_had_barrier = false;
 int get_is_interactive(void)
 {
     ASSERT_IS_MAIN_THREAD();
-    return is_interactive;
+    /* is_interactive is initialized to -1; ensure someone has popped/pushed it before then */
+    assert(is_interactive >= 0);
+    return is_interactive > 0;
 }
 
 bool get_proc_had_barrier()
@@ -296,15 +299,19 @@ int job_is_stopped(const job_t *j)
 
    \param j the job to test
 */
-int job_is_completed(const job_t *j)
+bool job_is_completed(const job_t *j)
 {
-    process_t *p;
     assert(j->first_process != NULL);
-    for (p = j->first_process; p->next; p = p->next)
-        ;
-
-    return p->completed;
-
+    bool result = true;
+    for (process_t *p = j->first_process; p != NULL; p = p->next)
+    {
+        if (! p->completed)
+        {
+            result = false;
+            break;
+        }
+    }
+    return result;
 }
 
 void job_set_flag(job_t *j, unsigned int flag, int set)
@@ -335,9 +342,7 @@ int job_signal(job_t *j, int signal)
     }
     else
     {
-        process_t *p;
-
-        for (p = j->first_process; p; p=p->next)
+        for (process_t *p = j->first_process; p; p=p->next)
         {
             if (! p->completed)
             {
@@ -512,7 +517,8 @@ static void handle_child_status(pid_t pid, int status)
 process_t::process_t() :
     argv_array(),
     argv0_narrow(),
-    type(0),
+    type(),
+    internal_block_node(NODE_OFFSET_INVALID),
     actual_cmd(),
     pid(0),
     pipe_write_fd(0),
@@ -535,14 +541,14 @@ process_t::~process_t()
         delete this->next;
 }
 
-job_t::job_t(job_id_t jobid) :
+job_t::job_t(job_id_t jobid, const io_chain_t &bio) :
     command_str(),
     command_narrow(),
+    block_io(bio),
     first_process(NULL),
     pgid(0),
     tmodes(),
     job_id(jobid),
-    io(),
     flags(0)
 {
 }
@@ -552,6 +558,17 @@ job_t::~job_t()
     if (first_process != NULL)
         delete first_process;
     release_job_id(job_id);
+}
+
+/* Return all the IO redirections. Start with the block IO, then walk over the processes */
+io_chain_t job_t::all_io_redirections() const
+{
+    io_chain_t result = this->block_io;
+    for (process_t *p = this->first_process; p != NULL; p = p->next)
+    {
+        result.append(p->io_chain());
+    }
+    return result;
 }
 
 /* This is called from a signal handler */
@@ -623,6 +640,9 @@ int job_reap(bool interactive)
     static int locked = 0;
 
     locked++;
+
+    /* Preserve the exit status */
+    const int saved_status = proc_get_last_status();
 
     /*
       job_read may fire an event handler, we do not want to call
@@ -737,6 +757,9 @@ int job_reap(bool interactive)
 
     if (found)
         fflush(stdout);
+
+    /* Restore the exit status. */
+    proc_set_last_status(saved_status);
 
     locked = 0;
 
@@ -872,9 +895,10 @@ static int select_try(job_t *j)
 
     FD_ZERO(&fds);
 
-    for (size_t idx = 0; idx < j->io.size(); idx++)
+    const io_chain_t chain = j->all_io_redirections();
+    for (size_t idx = 0; idx < chain.size(); idx++)
     {
-        const io_data_t *io = j->io.at(idx).get();
+        const io_data_t *io = chain.at(idx).get();
         if (io->io_mode == IO_BUFFER)
         {
             CAST_INIT(const io_pipe_t *, io_pipe, io);
@@ -913,9 +937,10 @@ static void read_try(job_t *j)
     /*
       Find the last buffer, which is the one we want to read from
     */
-    for (size_t idx = 0; idx < j->io.size(); idx++)
+    const io_chain_t chain = j->all_io_redirections();
+    for (size_t idx = 0; idx < chain.size(); idx++)
     {
-        io_data_t *d = j->io.at(idx).get();
+        io_data_t *d = chain.at(idx).get();
         if (d->io_mode == IO_BUFFER)
         {
             buff = static_cast<io_buffer_t *>(d);
@@ -1060,7 +1085,7 @@ void job_continue(job_t *j, bool cont)
         {
             /* Put the job into the foreground. Hack: ensure that stdin is marked as blocking first (#176). */
             make_fd_blocking(STDIN_FILENO);
-            
+
             signal_block();
 
             bool ok = terminal_give_to_job(j, cont);
@@ -1202,7 +1227,7 @@ void job_continue(job_t *j, bool cont)
                 }
             }
         }
-        
+
         /* Put the shell back in the foreground. */
         if (job_get_flag(j, JOB_TERMINAL) && job_get_flag(j, JOB_FOREGROUND))
         {

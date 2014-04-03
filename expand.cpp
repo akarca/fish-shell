@@ -18,7 +18,9 @@ parameter expansion.
 #include <limits.h>
 #include <sys/param.h>
 #include <sys/types.h>
+#ifdef HAVE_SYS_SYSCTL_H
 #include <sys/sysctl.h>
+#endif
 #include <termios.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -47,33 +49,9 @@ parameter expansion.
 #include "signal.h"
 #include "tokenizer.h"
 #include "complete.h"
+#include "iothread.h"
 
 #include "parse_util.h"
-
-/**
-   Error issued on invalid variable name
-*/
-#define COMPLETE_VAR_DESC _( L"The '$' character begins a variable name. The character '%lc', which directly followed a '$', is not allowed as a part of a variable name, and variable names may not be zero characters long. To learn more about variable expansion in fish, type 'help expand-variable'.")
-
-/**
-   Error issued on $?
-*/
-#define COMPLETE_YOU_WANT_STATUS _( L"$? is not a valid variable in fish. If you want the exit status of the last command, try $status.")
-
-/**
-   Error issued on invalid variable name
-*/
-#define COMPLETE_VAR_NULL_DESC _( L"The '$' begins a variable name. It was given at the end of an argument. Variable names may not be zero characters long. To learn more about variable expansion in fish, type 'help expand-variable'.")
-
-/**
-   Error issued on invalid variable name
-*/
-#define COMPLETE_VAR_BRACKET_DESC _( L"Did you mean %ls{$%ls}%ls? The '$' character begins a variable name. A bracket, which directly followed a '$', is not allowed as a part of a variable name, and variable names may not be zero characters long. To learn more about variable expansion in fish, type 'help expand-variable'." )
-
-/**
-   Error issued on invalid variable name
-*/
-#define COMPLETE_VAR_PARAN_DESC _( L"Did you mean (COMMAND)? In fish, the '$' character is only used for accessing variables. To learn more about command substitution in fish, type 'help expand-command-substitution'.")
 
 /**
    Description for child process
@@ -152,6 +130,46 @@ int expand_is_clean(const wchar_t *in)
 
     return 1;
 }
+
+
+/* Append a syntax error to the given error list */
+static void append_syntax_error(parse_error_list_t *errors, size_t source_start, const wchar_t *fmt, ...)
+{
+    if (errors != NULL)
+    {
+        parse_error_t error;
+        error.source_start = source_start;
+        error.source_length = 0;
+        error.code = parse_error_syntax;
+
+        va_list va;
+        va_start(va, fmt);
+        error.text = vformat_string(fmt, va);
+        va_end(va);
+
+        errors->push_back(error);
+    }
+}
+
+/* Append a cmdsub error to the given error list */
+static void append_cmdsub_error(parse_error_list_t *errors, size_t source_start, const wchar_t *fmt, ...)
+{
+    if (errors != NULL)
+    {
+        parse_error_t error;
+        error.source_start = source_start;
+        error.source_length = 0;
+        error.code = parse_error_cmdsubst;
+
+        va_list va;
+        va_start(va, fmt);
+        error.text = vformat_string(fmt, va);
+        va_end(va);
+
+        errors->push_back(error);
+    }
+}
+
 
 /**
    Return the environment variable value for the string starting at \c in.
@@ -558,6 +576,166 @@ std::vector<wcstring> expand_get_all_process_names(void)
     return result;
 }
 
+/* Helper function to do a job search. */
+struct find_job_data_t
+{
+    const wchar_t *proc; /* The process to search for - possibly numeric, possibly a name */
+    expand_flags_t flags;
+    std::vector<completion_t> *completions;
+};
+
+/* The following function is invoked on the main thread, because the job list is not thread safe. It should search the job list for something matching the given proc, and then return 1 to stop the search, 0 to continue it  */
+static int find_job(const struct find_job_data_t *info)
+{
+    ASSERT_IS_MAIN_THREAD();
+
+    const wchar_t * const proc = info->proc;
+    const expand_flags_t flags = info->flags;
+    std::vector<completion_t> &completions = *info->completions;
+
+    const job_t *j;
+    int found = 0;
+    // do the empty param check first, because an empty string passes our 'numeric' check
+    if (wcslen(proc)==0)
+    {
+        /*
+          This is an empty job expansion: '%'
+          It expands to the last job backgrounded.
+        */
+        job_iterator_t jobs;
+        while ((j = jobs.next()))
+        {
+            if (!j->command_is_empty())
+            {
+                append_completion(completions, to_string<long>(j->pgid));
+                break;
+            }
+        }
+        /*
+          You don't *really* want to flip a coin between killing
+          the last process backgrounded and all processes, do you?
+          Let's not try other match methods with the solo '%' syntax.
+        */
+        found = 1;
+    }
+    else if (iswnumeric(proc))
+    {
+        /*
+          This is a numeric job string, like '%2'
+        */
+
+        if (flags & ACCEPT_INCOMPLETE)
+        {
+            job_iterator_t jobs;
+            while ((j = jobs.next()))
+            {
+                wchar_t jid[16];
+                if (j->command_is_empty())
+                    continue;
+
+                swprintf(jid, 16, L"%d", j->job_id);
+
+                if (wcsncmp(proc, jid, wcslen(proc))==0)
+                {
+                    wcstring desc_buff = format_string(COMPLETE_JOB_DESC_VAL, j->command_wcstr());
+                    append_completion(completions,
+                                      jid+wcslen(proc),
+                                      desc_buff,
+                                      0);
+                }
+            }
+        }
+        else
+        {
+            int jid;
+            wchar_t *end;
+
+            errno = 0;
+            jid = fish_wcstoi(proc, &end, 10);
+            if (jid > 0 && !errno && !*end)
+            {
+                j = job_get(jid);
+                if ((j != 0) && (j->command_wcstr() != 0) && (!j->command_is_empty()))
+                {
+                    append_completion(completions, to_string<long>(j->pgid));
+                }
+            }
+        }
+        /*
+           Stop here so you can't match a random process name
+           when you're just trying to use job control.
+        */
+        found = 1;
+    }
+
+    if (! found)
+    {
+        job_iterator_t jobs;
+        while ((j = jobs.next()))
+        {
+
+            if (j->command_is_empty())
+                continue;
+
+            size_t offset;
+            if (match_pid(j->command(), proc, flags, &offset))
+            {
+                if (flags & ACCEPT_INCOMPLETE)
+                {
+                    append_completion(completions,
+                                      j->command_wcstr() + offset + wcslen(proc),
+                                      COMPLETE_JOB_DESC,
+                                      0);
+                }
+                else
+                {
+                    append_completion(completions, to_string<long>(j->pgid));
+                    found = 1;
+                }
+            }
+        }
+
+        if (! found)
+        {
+            jobs.reset();
+            while ((j = jobs.next()))
+            {
+                process_t *p;
+                if (j->command_is_empty())
+                    continue;
+                for (p=j->first_process; p; p=p->next)
+                {
+                    if (p->actual_cmd.empty())
+                        continue;
+
+                    size_t offset;
+                    if (match_pid(p->actual_cmd, proc, flags, &offset))
+                    {
+                        if (flags & ACCEPT_INCOMPLETE)
+                        {
+                            append_completion(completions,
+                                              wcstring(p->actual_cmd, offset + wcslen(proc)),
+                                              COMPLETE_CHILD_PROCESS_DESC,
+                                              0);
+                        }
+                        else
+                        {
+                            append_completion(completions,
+                                              to_string<long>(p->pid),
+                                              L"",
+                                              0);
+                            found = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return found;
+}
+
+
 /**
    Searches for a job with the specified job id, or a job or process
    which has the string \c proc as a prefix of its commandline.
@@ -580,123 +758,8 @@ static int find_process(const wchar_t *proc,
 
     if (!(flags & EXPAND_SKIP_JOBS))
     {
-        ASSERT_IS_MAIN_THREAD();
-        const job_t *j;
-
-        if (iswnumeric(proc) || (wcslen(proc)==0))
-        {
-            /*
-              This is a numeric job string, like '%2'
-            */
-
-            if (flags & ACCEPT_INCOMPLETE)
-            {
-                job_iterator_t jobs;
-                while ((j = jobs.next()))
-                {
-                    wchar_t jid[16];
-                    if (j->command_is_empty())
-                        continue;
-
-                    swprintf(jid, 16, L"%d", j->job_id);
-
-                    if (wcsncmp(proc, jid, wcslen(proc))==0)
-                    {
-                        wcstring desc_buff = format_string(COMPLETE_JOB_DESC_VAL, j->command_wcstr());
-                        append_completion(out,
-                                          jid+wcslen(proc),
-                                          desc_buff,
-                                          0);
-                    }
-                }
-
-            }
-            else
-            {
-
-                int jid;
-                wchar_t *end;
-
-                errno = 0;
-                jid = fish_wcstoi(proc, &end, 10);
-                if (jid > 0 && !errno && !*end)
-                {
-                    j = job_get(jid);
-                    if ((j != 0) && (j->command_wcstr() != 0))
-                    {
-                        {
-                            append_completion(out, to_string<long>(j->pgid));
-                            found = 1;
-                        }
-                    }
-                }
-            }
-        }
-        if (found)
-            return 1;
-
-        job_iterator_t jobs;
-        while ((j = jobs.next()))
-        {
-
-            if (j->command_is_empty())
-                continue;
-
-            size_t offset;
-            if (match_pid(j->command(), proc, flags, &offset))
-            {
-                if (flags & ACCEPT_INCOMPLETE)
-                {
-                    append_completion(out,
-                                      j->command_wcstr() + offset + wcslen(proc),
-                                      COMPLETE_JOB_DESC,
-                                      0);
-                }
-                else
-                {
-                    append_completion(out, to_string<long>(j->pgid));
-                    found = 1;
-                }
-            }
-        }
-
-        if (found)
-        {
-            return 1;
-        }
-
-        jobs.reset();
-        while ((j = jobs.next()))
-        {
-            process_t *p;
-            if (j->command_is_empty())
-                continue;
-            for (p=j->first_process; p; p=p->next)
-            {
-                if (p->actual_cmd.empty())
-                    continue;
-
-                size_t offset;
-                if (match_pid(p->actual_cmd, proc, flags, &offset))
-                {
-                    if (flags & ACCEPT_INCOMPLETE)
-                    {
-                        append_completion(out,
-                                          wcstring(p->actual_cmd, offset + wcslen(proc)),
-                                          COMPLETE_CHILD_PROCESS_DESC,
-                                          0);
-                    }
-                    else
-                    {
-                        append_completion(out,
-                                          to_string<long>(p->pid),
-                                          L"",
-                                          0);
-                        found = 1;
-                    }
-                }
-            }
-        }
+        const struct find_job_data_t data = {proc, flags, &out};
+        found = iothread_perform_on_main(find_job, &data);
 
         if (found)
         {
@@ -737,6 +800,14 @@ static int expand_pid(const wcstring &instr_with_sep,
                       expand_flags_t flags,
                       std::vector<completion_t> &out)
 {
+    /* Hack. If there's no INTERNAL_SEP and no PROCESS_EXPAND, then there's nothing to do. Check out this "null terminated string." */
+    const wchar_t some_chars[] = {INTERNAL_SEPARATOR, PROCESS_EXPAND, L'\0'};
+    if (instr_with_sep.find_first_of(some_chars) == wcstring::npos)
+    {
+        /* Nothing to do */
+        append_completion(out, instr_with_sep);
+        return 1;
+    }
 
     /* expand_string calls us with internal separators in instr...sigh */
     wcstring instr = instr_with_sep;
@@ -803,7 +874,7 @@ static int expand_pid(const wcstring &instr_with_sep,
 }
 
 
-void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_pos, int error_pos)
+void expand_variable_error(parser_t &parser, const wcstring &token, size_t token_pos, int error_pos, parse_error_list_t *errors)
 {
     size_t stop_pos = token_pos+1;
 
@@ -811,11 +882,11 @@ void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_
     {
         case BRACKET_BEGIN:
         {
-            wchar_t *cpy = wcsdup(token);
+            wchar_t *cpy = wcsdup(token.c_str());
             *(cpy+token_pos)=0;
             wchar_t *name = &cpy[stop_pos+1];
             wchar_t *end = wcschr(name, BRACKET_END);
-            wchar_t *post;
+            wchar_t *post = NULL;
             int is_var=0;
             if (end)
             {
@@ -830,21 +901,21 @@ void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_
 
             if (is_var)
             {
-                parser.error(SYNTAX_ERROR,
-                             error_pos,
-                             COMPLETE_VAR_BRACKET_DESC,
-                             cpy,
-                             name,
-                             post);
+                append_syntax_error(errors,
+                                    error_pos,
+                                    COMPLETE_VAR_BRACKET_DESC,
+                                    cpy,
+                                    name,
+                                    post);
             }
             else
             {
-                parser.error(SYNTAX_ERROR,
-                             error_pos,
-                             COMPLETE_VAR_BRACKET_DESC,
-                             L"",
-                             L"VARIABLE",
-                             L"");
+                append_syntax_error(errors,
+                                    error_pos,
+                                    COMPLETE_VAR_BRACKET_DESC,
+                                    L"",
+                                    L"VARIABLE",
+                                    L"");
             }
             free(cpy);
 
@@ -853,17 +924,17 @@ void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_
 
         case INTERNAL_SEPARATOR:
         {
-            parser.error(SYNTAX_ERROR,
-                         error_pos,
-                         COMPLETE_VAR_PARAN_DESC);
+            append_syntax_error(errors,
+                                error_pos,
+                                COMPLETE_VAR_PARAN_DESC);
             break;
         }
 
         case 0:
         {
-            parser.error(SYNTAX_ERROR,
-                         error_pos,
-                         COMPLETE_VAR_NULL_DESC);
+            append_syntax_error(errors,
+                                error_pos,
+                                COMPLETE_VAR_NULL_DESC);
             break;
         }
 
@@ -876,10 +947,10 @@ void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_
             else if (token_stop_char == ANY_STRING || token_stop_char == ANY_STRING_RECURSIVE)
                 token_stop_char = L'*';
 
-            parser.error(SYNTAX_ERROR,
-                         error_pos,
-                         (token_stop_char == L'?' ? COMPLETE_YOU_WANT_STATUS : COMPLETE_VAR_DESC),
-                         token_stop_char);
+            append_syntax_error(errors,
+                                error_pos,
+                                (token_stop_char == L'?' ? COMPLETE_YOU_WANT_STATUS : COMPLETE_VAR_DESC),
+                                token_stop_char);
             break;
         }
     }
@@ -888,7 +959,7 @@ void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_
 /**
    Parse an array slicing specification
  */
-static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &idx, size_t array_size)
+static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &idx, std::vector<size_t> &source_positions, size_t array_size)
 {
     wchar_t *end;
 
@@ -911,6 +982,7 @@ static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &
         }
 
         errno=0;
+        const size_t i1_src_pos = pos;
         tmp = wcstol(&in[pos], &end, 10);
         if ((errno) || (end == &in[pos]))
         {
@@ -927,6 +999,8 @@ static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &
             pos+=2;
             while (in[pos]==INTERNAL_SEPARATOR)
                 pos++;
+
+            const size_t number_start = pos;
             long tmp1 = wcstol(&in[pos], &end, 10);
             if ((errno) || (end == &in[pos]))
             {
@@ -942,12 +1016,14 @@ static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &
             {
                 // debug(0, L"Expand range [subst]: %i\n", jjj);
                 idx.push_back(jjj);
+                source_positions.push_back(number_start);
             }
             continue;
         }
 
         // debug( 0, L"Push idx %d", tmp );
         idx.push_back(i1);
+        source_positions.push_back(i1_src_pos);
     }
 
     if (end_ptr)
@@ -960,7 +1036,6 @@ static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &
 
     return 0;
 }
-
 
 
 /**
@@ -977,23 +1052,28 @@ static int parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long> &
    happens, don't edit it unless you know exactly what you are doing,
    and do proper testing afterwards.
 */
-static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::vector<completion_t> &out, long last_idx);
+static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::vector<completion_t> &out, long last_idx, parse_error_list_t *errors);
 
-static int expand_variables2(parser_t &parser, const wcstring &instr, std::vector<completion_t> &out, long last_idx)
+static int expand_variables2(parser_t &parser, const wcstring &instr, std::vector<completion_t> &out, long last_idx, parse_error_list_t *errors)
 {
     wchar_t *in = wcsdup(instr.c_str());
-    int result = expand_variables_internal(parser, in, out, last_idx);
+    int result = expand_variables_internal(parser, in, out, last_idx, errors);
     free(in);
     return result;
 }
 
-static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::vector<completion_t> &out, long last_idx)
+static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::vector<completion_t> &out, long last_idx, parse_error_list_t *errors)
 {
     int is_ok= 1;
     int empty=0;
 
     wcstring var_tmp;
+
+    // list of indexes
     std::vector<long> var_idx_list;
+
+    // parallel array of source positions of each index in the variable list
+    std::vector<size_t> var_pos_list;
 
     //  CHECK( out, 0 );
 
@@ -1026,7 +1106,7 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
 
             if (var_len == 0)
             {
-                expand_variable_error(parser, in, stop_pos-1, -1);
+                expand_variable_error(parser, in, stop_pos-1, -1, errors);
 
                 is_ok = 0;
                 break;
@@ -1044,16 +1124,17 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
                 {
                     tokenize_variable_array(var_val.c_str(), var_item_list);
 
-                    if (in[stop_pos] == L'[')
+                    const size_t slice_start = stop_pos;
+                    if (in[slice_start] == L'[')
                     {
                         wchar_t *slice_end;
                         all_vars=0;
 
-                        if (parse_slice(in + stop_pos, &slice_end, var_idx_list, var_item_list.size()))
+                        if (parse_slice(in + slice_start, &slice_end, var_idx_list, var_pos_list, var_item_list.size()))
                         {
-                            parser.error(SYNTAX_ERROR,
-                                         -1,
-                                         L"Invalid index value");
+                            append_syntax_error(errors,
+                                                stop_pos,
+                                                L"Invalid index value");
                             is_ok = 0;
                             break;
                         }
@@ -1063,20 +1144,17 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
                     if (!all_vars)
                     {
                         wcstring_list_t string_values(var_idx_list.size());
-
                         for (size_t j=0; j<var_idx_list.size(); j++)
                         {
                             long tmp = var_idx_list.at(j);
-                            /*
-                                           Check that we are within array
-                                           bounds. If not, truncate the list to
-                                           exit.
-                                           */
+                            size_t var_src_pos = var_pos_list.at(j);
+                            /* Check that we are within array bounds. If not, truncate the list to exit. */
                             if (tmp < 1 || (size_t)tmp > var_item_list.size())
                             {
-                                parser.error(SYNTAX_ERROR,
-                                             -1,
-                                             ARRAY_BOUNDS_ERR);
+                                /* The slice was parsed starting at stop_pos, so we have to add that to the error position */
+                                append_syntax_error(errors,
+                                                    slice_start + var_src_pos,
+                                                    ARRAY_BOUNDS_ERR);
                                 is_ok=0;
                                 var_idx_list.resize(j);
                                 break;
@@ -1114,7 +1192,7 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
                             }
                         }
                         res.append(in + stop_pos);
-                        is_ok &= expand_variables2(parser, res, out, i);
+                        is_ok &= expand_variables2(parser, res, out, i, errors);
                     }
                     else
                     {
@@ -1142,7 +1220,7 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
                                     }
                                     new_in.append(next);
                                     new_in.append(in + stop_pos);
-                                    is_ok &= expand_variables2(parser, new_in, out, i);
+                                    is_ok &= expand_variables2(parser, new_in, out, i, errors);
                                 }
                             }
 
@@ -1174,7 +1252,7 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
                     res.append(in);
                     res.append(in + stop_pos);
 
-                    is_ok &= expand_variables2(parser, res, out, i);
+                    is_ok &= expand_variables2(parser, res, out, i, errors);
                     return is_ok;
                 }
             }
@@ -1194,7 +1272,7 @@ static int expand_variables_internal(parser_t &parser, wchar_t * const in, std::
 /**
    Perform bracket expansion
 */
-static int expand_brackets(parser_t &parser, const wcstring &instr, int flags, std::vector<completion_t> &out)
+static int expand_brackets(parser_t &parser, const wcstring &instr, int flags, std::vector<completion_t> &out, parse_error_list_t *errors)
 {
     bool syntax_error = false;
     int bracket_count=0;
@@ -1264,15 +1342,15 @@ static int expand_brackets(parser_t &parser, const wcstring &instr, int flags, s
                 mod.push_back(BRACKET_END);
             }
 
-            return expand_brackets(parser, mod, 1, out);
+            return expand_brackets(parser, mod, 1, out, errors);
         }
     }
 
     if (syntax_error)
     {
-        parser.error(SYNTAX_ERROR,
-                     -1,
-                     _(L"Mismatched brackets"));
+        append_syntax_error(errors,
+                            SOURCE_LOCATION_UNKNOWN,
+                            _(L"Mismatched brackets"));
         return 0;
     }
 
@@ -1300,7 +1378,7 @@ static int expand_brackets(parser_t &parser, const wcstring &instr, int flags, s
                 whole_item.append(in, length_preceding_brackets);
                 whole_item.append(item_begin, item_len);
                 whole_item.append(bracket_end + 1);
-                expand_brackets(parser, whole_item, flags, out);
+                expand_brackets(parser, whole_item, flags, out, errors);
 
                 item_begin = pos+1;
                 if (pos == bracket_end)
@@ -1324,7 +1402,7 @@ static int expand_brackets(parser_t &parser, const wcstring &instr, int flags, s
 /**
  Perform cmdsubst expansion
  */
-static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<completion_t> &outList)
+static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<completion_t> &out_list, parse_error_list_t *errors)
 {
     wchar_t *paran_begin=0, *paran_end=0;
     std::vector<wcstring> sub_res;
@@ -1334,18 +1412,15 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
     const wchar_t * const in = input.c_str();
 
     int parse_ret;
-    switch (parse_ret = parse_util_locate_cmdsubst(in,
-                        &paran_begin,
-                        &paran_end,
-                        0))
+    switch (parse_ret = parse_util_locate_cmdsubst(in, &paran_begin, &paran_end, false))
     {
         case -1:
-            parser.error(SYNTAX_ERROR,
-                         -1,
-                         L"Mismatched parenthesis");
+            append_syntax_error(errors,
+                                SOURCE_LOCATION_UNKNOWN,
+                                L"Mismatched parenthesis");
             return 0;
         case 0:
-            outList.push_back(completion_t(input));
+            append_completion(out_list, input);
             return 1;
         case 1:
 
@@ -1356,7 +1431,7 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
 
     if (exec_subshell(subcmd, sub_res, true /* do apply exit status */) == -1)
     {
-        parser.error(CMDSUBST_ERROR, -1, L"Unknown error while evaulating command substitution");
+        append_cmdsub_error(errors, SOURCE_LOCATION_UNKNOWN, L"Unknown error while evaulating command substitution");
         return 0;
     }
 
@@ -1364,25 +1439,26 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
     if (*tail_begin == L'[')
     {
         std::vector<long> slice_idx;
+        std::vector<size_t> slice_source_positions;
         wchar_t *slice_end;
 
-        if (parse_slice(tail_begin, &slice_end, slice_idx, sub_res.size()))
+        if (parse_slice(tail_begin, &slice_end, slice_idx, slice_source_positions, sub_res.size()))
         {
-            parser.error(SYNTAX_ERROR, -1, L"Invalid index value");
+            append_syntax_error(errors, SOURCE_LOCATION_UNKNOWN, L"Invalid index value");
             return 0;
         }
         else
         {
-            std::vector<wcstring> sub_res2;
+            wcstring_list_t sub_res2;
             tail_begin = slice_end;
             for (i=0; i < slice_idx.size(); i++)
             {
                 long idx = slice_idx.at(i);
                 if (idx < 1 || (size_t)idx > sub_res.size())
                 {
-                    parser.error(SYNTAX_ERROR,
-                                 -1,
-                                 ARRAY_BOUNDS_ERR);
+                    append_syntax_error(errors,
+                                        SOURCE_LOCATION_UNKNOWN,
+                                        ARRAY_BOUNDS_ERR);
                     return 0;
                 }
                 idx = idx-1;
@@ -1402,7 +1478,7 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
        of the string is inserted into the tail_expand array list
        */
     std::vector<completion_t> tail_expand;
-    expand_cmdsubst(parser, tail_begin, tail_expand);
+    expand_cmdsubst(parser, tail_begin, tail_expand, errors /* TODO: offset error locations */);
 
     /*
        Combine the result of the current command substitution with the
@@ -1410,15 +1486,15 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
        */
     for (i=0; i<sub_res.size(); i++)
     {
-        wcstring sub_item = sub_res.at(i);
-        wcstring sub_item2 = escape_string(sub_item, 1);
+        const wcstring &sub_item = sub_res.at(i);
+        const wcstring sub_item2 = escape_string(sub_item, 1);
+
+        wcstring whole_item;
 
         for (j=0; j < tail_expand.size(); j++)
         {
-
-            wcstring whole_item;
-
-            wcstring tail_item = tail_expand.at(j).completion;
+            whole_item.clear();
+            const wcstring &tail_item = tail_expand.at(j).completion;
 
             //sb_append_substring( &whole_item, in, len1 );
             whole_item.append(in, paran_begin-in);
@@ -1436,31 +1512,11 @@ static int expand_cmdsubst(parser_t &parser, const wcstring &input, std::vector<
             whole_item.append(tail_item);
 
             //al_push( out, whole_item.buff );
-            outList.push_back(completion_t(whole_item));
+            append_completion(out_list, whole_item);
         }
     }
 
     return 1;
-}
-
-/**
-   Wrapper around unescape funtion. Issues an error() on failiure.
-*/
-__attribute__((unused))
-static wchar_t *expand_unescape(parser_t &parser, const wchar_t * in, int escape_special)
-{
-    wchar_t *res = unescape(in, escape_special);
-    if (!res)
-        parser.error(SYNTAX_ERROR, -1, L"Unexpected end of string");
-    return res;
-}
-
-static wcstring expand_unescape_string(const wcstring &in, int escape_special)
-{
-    wcstring tmp = in;
-    unescape_string(tmp, escape_special);
-    /* Need to detect error here */
-    return tmp;
 }
 
 /* Given that input[0] is HOME_DIRECTORY or tilde (ugh), return the user's name. Return the empty string if it is just a tilde. Also return by reference the index of the first character of the remaining part of the string (e.g. the subsequent slash) */
@@ -1490,7 +1546,7 @@ static void expand_home_directory(wcstring &input)
     {
         size_t tail_idx;
         wcstring username = get_home_directory_name(input, &tail_idx);
-        
+
         bool tilde_error = false;
         wcstring home;
         if (username.empty())
@@ -1539,7 +1595,7 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
     // If it does not, there's nothing to do
     if (input.empty() || input.at(0) != L'~')
         return;
-    
+
     // We only operate on completions that replace their contents
     // If we don't have any, we're done.
     // In particular, empty vectors are common.
@@ -1554,15 +1610,15 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
     }
     if (! has_candidate_completion)
         return;
-    
+
     size_t tail_idx;
     wcstring username_with_tilde = L"~";
     username_with_tilde.append(get_home_directory_name(input, &tail_idx));
-    
+
     // Expand username_with_tilde
     wcstring home = username_with_tilde;
     expand_tilde(home);
-    
+
     // Now for each completion that starts with home, replace it with the username_with_tilde
     for (size_t i=0; i < completions->size(); i++)
     {
@@ -1570,11 +1626,36 @@ static void unexpand_tildes(const wcstring &input, std::vector<completion_t> *co
         if ((comp.flags & COMPLETE_REPLACES_TOKEN) && string_prefixes_string(home, comp.completion))
         {
             comp.completion.replace(0, home.size(), username_with_tilde);
-            
+
             // And mark that our tilde is literal, so it doesn't try to escape it
             comp.flags |= COMPLETE_DONT_ESCAPE_TILDES;
         }
     }
+}
+
+// If the given path contains the user's home directory, replace that with a tilde
+// We don't try to be smart about case insensitivity, etc.
+wcstring replace_home_directory_with_tilde(const wcstring &str)
+{
+    // only absolute paths get this treatment
+    wcstring result = str;
+    if (string_prefixes_string(L"/", result))
+    {
+        wcstring home_directory = L"~";
+        expand_tilde(home_directory);
+        if (! string_suffixes_string(L"/", home_directory))
+        {
+            home_directory.push_back(L'/');
+        }
+
+        // Now check if the home_directory prefixes the string
+        if (string_prefixes_string(home_directory, result))
+        {
+            // Success
+            result.replace(0, home_directory.size(), L"~/");
+        }
+    }
+    return result;
 }
 
 /**
@@ -1606,30 +1687,19 @@ static void remove_internal_separator(wcstring &str, bool conv)
 }
 
 
-int expand_string(const wcstring &input, std::vector<completion_t> &output, expand_flags_t flags)
-{    
+int expand_string(const wcstring &input, std::vector<completion_t> &output, expand_flags_t flags, parse_error_list_t *errors)
+{
     parser_t parser(PARSER_TYPE_ERRORS_ONLY, true /* show errors */);
-    
+
     size_t i;
     int res = EXPAND_OK;
 
-    /* Make the empty string handling behavior explicit. It's a little weird, but expand_one depends on this. */
-    if (input.empty())
+    if ((!(flags & ACCEPT_INCOMPLETE)) && expand_is_clean(input.c_str()))
     {
-        /* Return OK. But only append a completion if ACCEPT_INCOMPLETE is not set. */
-        if (! (flags & ACCEPT_INCOMPLETE))
-        {
-            output.push_back(completion_t(input));
-        }
+        append_completion(output, input);
         return EXPAND_OK;
     }
 
-    if ((!(flags & ACCEPT_INCOMPLETE)) && expand_is_clean(input.c_str()))
-    {
-        output.push_back(completion_t(input));
-        return EXPAND_OK;
-    }
-    
     std::vector<completion_t> clist1, clist2;
     std::vector<completion_t> *in = &clist1, *out = &clist2;
 
@@ -1637,23 +1707,20 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
     {
         wchar_t *begin, *end;
 
-        if (parse_util_locate_cmdsubst(input.c_str(),
-                                       &begin,
-                                       &end,
-                                       1) != 0)
+        if (parse_util_locate_cmdsubst(input.c_str(), &begin, &end, true) != 0)
         {
-            parser.error(CMDSUBST_ERROR, -1, L"Command substitutions not allowed");
+            append_cmdsub_error(errors, SOURCE_LOCATION_UNKNOWN, L"Command substitutions not allowed");
             return EXPAND_ERROR;
         }
-        in->push_back(completion_t(input));
+        append_completion(*in, input);
     }
     else
     {
-        int cmdsubst_ok = expand_cmdsubst(parser, input, *in);
+        int cmdsubst_ok = expand_cmdsubst(parser, input, *in, errors);
         if (! cmdsubst_ok)
             return EXPAND_ERROR;
     }
-    
+
     for (i=0; i < in->size(); i++)
     {
         /*
@@ -1661,8 +1728,8 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
          expand_string to expand incomplete strings from the
          commandline.
          */
-        int unescape_flags = UNESCAPE_SPECIAL | UNESCAPE_INCOMPLETE;
-        wcstring next = expand_unescape_string(in->at(i).completion, unescape_flags);
+        wcstring next;
+        unescape_string(in->at(i).completion, &next, UNESCAPE_SPECIAL | UNESCAPE_INCOMPLETE);
 
         if (EXPAND_SKIP_VARIABLES & flags)
         {
@@ -1673,11 +1740,11 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
                     next[i] = L'$';
                 }
             }
-            out->push_back(completion_t(next));
+            append_completion(*out, next);
         }
         else
         {
-            if (!expand_variables2(parser, next, *out, next.size() - 1))
+            if (!expand_variables2(parser, next, *out, next.size() - 1, errors))
             {
                 return EXPAND_ERROR;
             }
@@ -1689,9 +1756,9 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
 
     for (i=0; i < in->size(); i++)
     {
-        wcstring next = in->at(i).completion;
+        const wcstring &next = in->at(i).completion;
 
-        if (!expand_brackets(parser, next, flags, *out))
+        if (!expand_brackets(parser, next, flags, *out, errors))
         {
             return EXPAND_ERROR;
         }
@@ -1709,7 +1776,7 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
 
         if (flags & ACCEPT_INCOMPLETE)
         {
-            if (next[0] == PROCESS_EXPAND)
+            if (! next.empty() && next.at(0) == PROCESS_EXPAND)
             {
                 /*
                  If process expansion matches, we are not
@@ -1722,7 +1789,7 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
             }
             else
             {
-                out->push_back(completion_t(next));
+                append_completion(*out, next);
             }
         }
         else
@@ -1745,8 +1812,14 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
         remove_internal_separator(next_str, (EXPAND_SKIP_WILDCARDS & flags) ? true : false);
         const wchar_t *next = next_str.c_str();
 
-        if (((flags & ACCEPT_INCOMPLETE) && (!(flags & EXPAND_SKIP_WILDCARDS))) ||
-                wildcard_has(next, 1))
+        const bool has_wildcard = wildcard_has(next, 1);
+
+        if (has_wildcard && (flags & EXECUTABLES_ONLY))
+        {
+            // Don't do wildcard expansion for executables. See #785. So do nothing here.
+        }
+        else if (((flags & ACCEPT_INCOMPLETE) && (!(flags & EXPAND_SKIP_WILDCARDS))) ||
+                 has_wildcard)
         {
             const wchar_t *start, *rest;
 
@@ -1781,7 +1854,7 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
                     case 1:
                     {
                         res = EXPAND_WILDCARD_MATCH;
-                        sort_completions(expanded);
+                        std::sort(expanded.begin(), expanded.end(), completion_t::is_alphabetically_less_than);
                         out->insert(out->end(), expanded.begin(), expanded.end());
                         break;
                     }
@@ -1796,26 +1869,26 @@ int expand_string(const wcstring &input, std::vector<completion_t> &output, expa
         }
         else
         {
-            if (! (flags & ACCEPT_INCOMPLETE))
+            if (!(flags & ACCEPT_INCOMPLETE))
             {
-                out->push_back(completion_t(next_str));
+                append_completion(*out, next_str);
             }
         }
     }
-    
+
     // Hack to un-expand tildes (see #647)
-    if (! (flags & EXPAND_SKIP_HOME_DIRECTORIES))
+    if (!(flags & EXPAND_SKIP_HOME_DIRECTORIES))
     {
         unexpand_tildes(input, out);
     }
-    
+
     // Return our output
     output.insert(output.end(), out->begin(), out->end());
 
     return res;
 }
 
-bool expand_one(wcstring &string, expand_flags_t flags)
+bool expand_one(wcstring &string, expand_flags_t flags, parse_error_list_t *errors)
 {
     std::vector<completion_t> completions;
     bool result = false;
@@ -1825,7 +1898,7 @@ bool expand_one(wcstring &string, expand_flags_t flags)
         return true;
     }
 
-    if (expand_string(string, completions, flags))
+    if (expand_string(string, completions, flags | EXPAND_NO_DESCRIPTIONS, errors))
     {
         if (completions.size() == 1)
         {
@@ -1928,22 +2001,61 @@ bool fish_openSUSE_dbus_hack_hack_hack_hack(std::vector<completion_t> *args)
                         val.resize(last_good + 1);
 
                     args->clear();
-                    args->push_back(completion_t(L"set"));
+                    append_completion(*args, L"set");
                     if (key == L"DBUS_SESSION_BUS_ADDRESS")
-                        args->push_back(completion_t(L"-x"));
-                    args->push_back(completion_t(key));
-                    args->push_back(completion_t(val));
+                        append_completion(*args, L"-x");
+                    append_completion(*args, key);
+                    append_completion(*args, val);
                     result = true;
                 }
                 else if (string_prefixes_string(L"export DBUS_SESSION_BUS_ADDRESS;", cmd))
                 {
                     /* Nothing, we already exported it */
                     args->clear();
-                    args->push_back(completion_t(L"echo"));
-                    args->push_back(completion_t(L"-n"));
+                    append_completion(*args, L"echo");
+                    append_completion(*args, L"-n");
                     result = true;
                 }
             }
+        }
+    }
+    return result;
+}
+
+bool expand_abbreviation(const wcstring &src, wcstring *output)
+{
+    if (src.empty())
+        return false;
+
+    /* Get the abbreviations. Return false if we have none */
+    env_var_t var = env_get_string(USER_ABBREVIATIONS_VARIABLE_NAME);
+    if (var.missing_or_empty())
+        return false;
+
+    bool result = false;
+    wcstring line;
+    wcstokenizer tokenizer(var, ARRAY_SEP_STR);
+    while (tokenizer.next(line))
+    {
+        /* Line is expected to be of the form 'foo=bar'. Parse out the first =. Be forgiving about spaces, but silently skip on failure (no equals, or equals at the end or beginning). Try to avoid copying any strings until we are sure this is a match. */
+        size_t equals = line.find(L'=');
+        if (equals == wcstring::npos || equals == 0 || equals + 1 == line.size())
+            continue;
+
+        /* Find the character just past the end of the command. Walk backwards, skipping spaces. */
+        size_t cmd_end = equals;
+        while (cmd_end > 0 && iswspace(line.at(cmd_end - 1)))
+            cmd_end--;
+
+        /* See if this command matches */
+        if (line.compare(0, cmd_end, src) == 0)
+        {
+            /* Success. Set output to everythign past the end of the string. */
+            if (output != NULL)
+                output->assign(line, equals + 1, wcstring::npos);
+
+            result = true;
+            break;
         }
     }
     return result;

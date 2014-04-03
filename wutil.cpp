@@ -294,7 +294,7 @@ int make_fd_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     int err = 0;
-    if (! (flags & O_NONBLOCK))
+    if (!(flags & O_NONBLOCK))
     {
         err = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
@@ -319,6 +319,11 @@ static inline void safe_append(char *buffer, const char *s, size_t buffsize)
 
 const char *safe_strerror(int err)
 {
+#if defined(__UCLIBC__)
+    // uClibc does not have sys_errlist, however, its strerror is believed to be async-safe
+    // See #808
+    return strerror(err);
+#else
     if (err >= 0 && err < sys_nerr && sys_errlist[err] != NULL)
     {
         return sys_errlist[err];
@@ -340,6 +345,7 @@ const char *safe_strerror(int err)
         errno = saved_err;
         return buff;
     }
+#endif
 }
 
 void safe_perror(const char *message)
@@ -470,7 +476,7 @@ const wchar_t *wgettext(const wchar_t *in)
     {
         cstring mbs_in = wcs2string(key);
         char *out = fish_gettext(mbs_in.c_str());
-        val = new wcstring(format_string(L"%s", out));
+        val = new wcstring(format_string(L"%s", out)); //note that this writes into the map!
     }
     errno = err;
     return val->c_str();

@@ -19,10 +19,9 @@ enum token_type
 {
     TOK_NONE, /**< Tokenizer not yet constructed */
     TOK_ERROR, /**< Error reading token */
-    TOK_INVALID,/**< Invalid token */
     TOK_STRING,/**< String token */
     TOK_PIPE,/**< Pipe token */
-    TOK_END,/**< End token */
+    TOK_END,/**< End token (semicolon or newline, not literal end) */
     TOK_REDIRECT_OUT, /**< redirection token */
     TOK_REDIRECT_APPEND,/**< redirection append token */
     TOK_REDIRECT_IN,/**< input redirection token */
@@ -77,7 +76,7 @@ struct tokenizer_t
     wcstring last_token;
 
     /** Type of last token*/
-    int last_type;
+    enum token_type last_type;
 
     /** Offset of last token*/
     size_t last_pos;
@@ -123,7 +122,7 @@ void tok_next(tokenizer_t *tok);
 /**
   Returns the type of the last token. Must be one of the values in the token_type enum.
 */
-int tok_last_type(tokenizer_t *tok);
+enum token_type tok_last_type(tokenizer_t *tok);
 
 /**
   Returns the last token string. The string should not be freed by the caller.
@@ -143,13 +142,18 @@ int tok_has_next(tokenizer_t *tok);
 /**
   Returns the position of the beginning of the current token in the original string
 */
-int tok_get_pos(tokenizer_t *tok);
+int tok_get_pos(const tokenizer_t *tok);
+
+/** Returns the extent of the current token */
+size_t tok_get_extent(const tokenizer_t *tok);
+
+/** Returns the token type after the current one, without adjusting the position. Optionally returns the next string by reference. */
+enum token_type tok_peek_next(tokenizer_t *tok, wcstring *out_next_string);
 
 /**
    Returns the original string to tokenizer
  */
 const wchar_t *tok_string(tokenizer_t *tok);
-
 
 /**
    Returns only the first token from the specified string. This is a
@@ -182,6 +186,15 @@ const wchar_t *tok_get_desc(int type);
    Get tokenizer error type. Should only be called if tok_last_tope returns TOK_ERROR.
 */
 int tok_get_error(tokenizer_t *tok);
+
+/* Helper function to determine redirection type from a string, or TOK_NONE if the redirection is invalid. Also returns the fd by reference. */
+enum token_type redirection_type_for_string(const wcstring &str, int *out_fd = NULL);
+
+/* Helper function to determine which fd is redirected by a pipe */
+int fd_redirected_by_pipe(const wcstring &str);
+
+/* Helper function to return oflags (as in open(2)) for a redirection type */
+int oflags_for_redirection_type(enum token_type type);
 
 enum move_word_style_t
 {

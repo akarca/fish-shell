@@ -11,9 +11,15 @@ inputrc information for key bindings.
 #include <wchar.h>
 #include "input_common.h"
 
+
+#define DEFAULT_BIND_MODE L"default"
+#define FISH_BIND_MODE_VAR L"fish_bind_mode"
+
 /**
    Key codes for inputrc-style keyboard functions that are passed on
    to the caller of input_read()
+
+   NOTE: IF YOU MODIFY THIS YOU MUST UPDATE THE name_arr AND code_arr VARIABLES TO MATCH!
 */
 enum
 {
@@ -31,6 +37,7 @@ enum
     R_YANK,
     R_YANK_POP,
     R_COMPLETE,
+    R_COMPLETE_AND_SEARCH,
     R_BEGINNING_OF_HISTORY,
     R_END_OF_HISTORY,
     R_BACKWARD_KILL_LINE,
@@ -38,22 +45,38 @@ enum
     R_KILL_WORD,
     R_BACKWARD_KILL_WORD,
     R_BACKWARD_KILL_PATH_COMPONENT,
-    R_DUMP_FUNCTIONS,
     R_HISTORY_TOKEN_SEARCH_BACKWARD,
     R_HISTORY_TOKEN_SEARCH_FORWARD,
     R_SELF_INSERT,
+    R_TRANSPOSE_CHARS,
+    R_TRANSPOSE_WORDS,
+    R_UPCASE_WORD,
+    R_DOWNCASE_WORD,
+    R_CAPITALIZE_WORD,
     R_VI_ARG_DIGIT,
     R_VI_DELETE_TO,
     R_EXECUTE,
     R_BEGINNING_OF_BUFFER,
     R_END_OF_BUFFER,
     R_REPAINT,
+    R_FORCE_REPAINT,
     R_UP_LINE,
     R_DOWN_LINE,
     R_SUPPRESS_AUTOSUGGESTION,
-    R_ACCEPT_AUTOSUGGESTION
-}
-;
+    R_ACCEPT_AUTOSUGGESTION,
+    R_BEGIN_SELECTION,
+    R_END_SELECTION,
+    R_KILL_SELECTION,
+    R_FORWARD_JUMP,
+    R_BACKWARD_JUMP,
+    R_AND,
+    R_CANCEL
+};
+
+wcstring describe_char(wint_t c);
+
+#define R_MIN R_NULL
+#define R_MAX R_AND
 
 /**
    Initialize the terminal by calling setupterm, and set up arrays
@@ -97,22 +120,46 @@ void input_unreadch(wint_t ch);
    \param sequence the sequence to bind
    \param command an input function that will be run whenever the key sequence occurs
 */
-void input_mapping_add(const wchar_t *sequence, const wchar_t *command);
+void input_mapping_add(const wchar_t *sequence, const wchar_t *command,
+                       const wchar_t *mode = DEFAULT_BIND_MODE,
+                       const wchar_t *new_mode = DEFAULT_BIND_MODE);
+
+void input_mapping_add(const wchar_t *sequence, const wchar_t **commands, size_t commands_len,
+                       const wchar_t *mode = DEFAULT_BIND_MODE, const wchar_t *new_mode = DEFAULT_BIND_MODE);
 
 /**
-   Insert all mapping names into the specified wcstring_list_t
+   Returns all mapping names
  */
-void input_mapping_get_names(wcstring_list_t &lst);
+wcstring_list_t input_mapping_get_names();
 
 /**
    Erase binding for specified key sequence
  */
-bool input_mapping_erase(const wchar_t *sequence);
+bool input_mapping_erase(const wchar_t *sequence, const wchar_t *mode = DEFAULT_BIND_MODE);
 
 /**
    Gets the command bound to the specified key sequence. Returns true if it exists, false if not.
  */
-bool input_mapping_get(const wcstring &sequence, wcstring &cmd);
+bool input_mapping_get(const wcstring &sequence, wcstring_list_t *out_cmds, wcstring *out_mode, wcstring *out_new_mode);
+
+/**
+    Return the current bind mode
+*/
+wcstring input_get_bind_mode();
+
+/**
+    Set the current bind mode
+*/
+void input_set_bind_mode(const wcstring &bind_mode);
+
+
+wchar_t input_function_pop_arg();
+
+
+/**
+    Sets the return status of the most recently executed input function
+*/
+void input_function_set_status(bool status);
 
 /**
    Return the sequence for the terminfo variable of the specified name.

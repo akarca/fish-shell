@@ -8,6 +8,7 @@
 #define FISH_PARSE_UTIL_H
 
 #include "autoload.h"
+#include "parse_tree.h"
 #include <wchar.h>
 #include <map>
 #include <set>
@@ -18,14 +19,39 @@
    \param in the string to search for subshells
    \param begin the starting paranthesis of the subshell
    \param end the ending paranthesis of the subshell
-   \param flags set this variable to ACCEPT_INCOMPLETE if in tab_completion mode
+   \param accept_incomplete whether to permit missing closing parenthesis
    \return -1 on syntax error, 0 if no subshells exist and 1 on sucess
 */
 
 int parse_util_locate_cmdsubst(const wchar_t *in,
                                wchar_t **begin,
                                wchar_t **end,
-                               int flags);
+                               bool accept_incomplete);
+
+/** Same as parse_util_locate_cmdsubst, but handles square brackets [ ] */
+int parse_util_locate_slice(const wchar_t *in,
+                            wchar_t **begin,
+                            wchar_t **end,
+                            bool accept_incomplete);
+
+/**
+   Alternative API. Iterate over command substitutions.
+
+   \param str the string to search for subshells
+   \param inout_cursor_offset On input, the location to begin the search. On output, either the end of the string, or just after the closed-paren.
+   \param out_contents On output, the contents of the command substitution
+   \param out_start On output, the offset of the start of the command substitution (open paren)
+   \param out_end On output, the offset of the end of the command substitution (close paren), or the end of the string if it was incomplete
+   \param accept_incomplete whether to permit missing closing parenthesis
+   \return -1 on syntax error, 0 if no subshells exist and 1 on sucess
+*/
+
+int parse_util_locate_cmdsubst_range(const wcstring &str,
+                                     size_t *inout_cursor_offset,
+                                     wcstring *out_contents,
+                                     size_t *out_start,
+                                     size_t *out_end,
+                                     bool accept_incomplete);
 
 /**
    Find the beginning and end of the command substitution under the
@@ -125,6 +151,15 @@ void parse_util_set_argv(const wchar_t * const *argv, const wcstring_list_t &nam
 wchar_t *parse_util_unescape_wildcards(const wchar_t *in);
 
 /**
+   Checks if the specified string is a help option.
+
+   \param s the string to test
+   \param min_match is the minimum number of characters that must match in a long style option, i.e. the longest common prefix between --help and any other option. If less than 3, 3 will be assumed.
+*/
+bool parse_util_argument_is_help(const wchar_t *s, int min_match);
+
+
+/**
    Calculates information on the parameter at the specified index.
 
    \param cmd The command to be analyzed
@@ -140,5 +175,16 @@ void parse_util_get_parameter_info(const wcstring &cmd, const size_t pos, wchar_
 */
 wcstring parse_util_escape_string_with_quote(const wcstring &cmd, wchar_t quote);
 
+/** Given a string, parse it as fish code and then return the indents. The return value has the same size as the string */
+std::vector<int> parse_util_compute_indents(const wcstring &src);
+
+parser_test_error_bits_t parse_util_detect_errors(const wcstring &buff_src, parse_error_list_t *out_errors = NULL);
+
+/**
+   Test if this argument contains any errors. Detected errors include syntax errors in command substitutions, improperly escaped characters and improper use of the variable expansion operator.
+
+   This does NOT currently detect unterminated quotes.
+*/
+parser_test_error_bits_t parse_util_detect_errors_in_argument(const parse_node_t &node, const wcstring &arg_src, parse_error_list_t *out_errors = NULL);
 
 #endif

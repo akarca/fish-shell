@@ -71,7 +71,7 @@ void io_pipe_t::print() const
 void io_buffer_t::print() const
 {
     fprintf(stderr, "buffer %p (input: %s, size %lu)\n", out_buffer_ptr(),
-            is_input ? "yes" : "no", out_buffer_size());
+            is_input ? "yes" : "no", (unsigned long) out_buffer_size());
 }
 
 void io_buffer_t::read()
@@ -123,14 +123,11 @@ void io_buffer_t::read()
 }
 
 
-io_buffer_t *io_buffer_t::create(bool is_input, int fd)
+io_buffer_t *io_buffer_t::create(int fd)
 {
     bool success = true;
-    if (fd == -1)
-    {
-        fd = is_input ? 0 : 1;
-    }
-    io_buffer_t *buffer_redirect = new io_buffer_t(fd, is_input);
+    assert(fd >= 0);
+    io_buffer_t *buffer_redirect = new io_buffer_t(fd);
 
     if (exec_pipe(buffer_redirect->pipe_fd) == -1)
     {
@@ -200,6 +197,17 @@ void io_chain_t::push_back(const shared_ptr<io_data_t> &element)
     // Ensure we never push back NULL
     assert(element.get() != NULL);
     std::vector<shared_ptr<io_data_t> >::push_back(element);
+}
+
+void io_chain_t::push_front(const shared_ptr<io_data_t> &element)
+{
+    assert(element.get() != NULL);
+    this->insert(this->begin(), element);
+}
+
+void io_chain_t::append(const io_chain_t &chain)
+{
+    this->insert(this->end(), chain.begin(), chain.end());
 }
 
 void io_remove(io_chain_t &list, const shared_ptr<const io_data_t> &element)

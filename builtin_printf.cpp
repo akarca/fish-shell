@@ -26,6 +26,7 @@
    \a = alert (bell)
    \b = backspace
    \c = produce no further output
+   \e = escape
    \f = form feed
    \n = new line
    \r = carriage return
@@ -100,23 +101,46 @@ static int hex_to_bin(const wchar_t &c)
 {
     switch (c)
     {
-        case L'0': return 0;
-        case L'1': return 1;
-        case L'2': return 2;
-        case L'3': return 3;
-        case L'4': return 4;
-        case L'5': return 5;
-        case L'6': return 6;
-        case L'7': return 7;
-        case L'8': return 8;
-        case L'9': return 9;
-        case L'a': case L'A': return 10;
-        case L'b': case L'B': return 11;
-        case L'c': case L'C': return 12;
-        case L'd': case L'D': return 13;
-        case L'e': case L'E': return 14;
-        case L'f': case L'F': return 15;
-        default: return -1;
+        case L'0':
+            return 0;
+        case L'1':
+            return 1;
+        case L'2':
+            return 2;
+        case L'3':
+            return 3;
+        case L'4':
+            return 4;
+        case L'5':
+            return 5;
+        case L'6':
+            return 6;
+        case L'7':
+            return 7;
+        case L'8':
+            return 8;
+        case L'9':
+            return 9;
+        case L'a':
+        case L'A':
+            return 10;
+        case L'b':
+        case L'B':
+            return 11;
+        case L'c':
+        case L'C':
+            return 12;
+        case L'd':
+        case L'D':
+            return 13;
+        case L'e':
+        case L'E':
+            return 14;
+        case L'f':
+        case L'F':
+            return 15;
+        default:
+            return -1;
     }
 }
 
@@ -124,15 +148,24 @@ static int octal_to_bin(wchar_t c)
 {
     switch (c)
     {
-        case L'0': return 0;
-        case L'1': return 1;
-        case L'2': return 2;
-        case L'3': return 3;
-        case L'4': return 4;
-        case L'5': return 5;
-        case L'6': return 6;
-        case L'7': return 7;
-        default: return -1;
+        case L'0':
+            return 0;
+        case L'1':
+            return 1;
+        case L'2':
+            return 2;
+        case L'3':
+            return 3;
+        case L'4':
+            return 4;
+        case L'5':
+            return 5;
+        case L'6':
+            return 6;
+        case L'7':
+            return 7;
+        default:
+            return -1;
     }
 }
 
@@ -160,11 +193,6 @@ double C_STRTOD(wchar_t const *nptr, wchar_t **endptr)
     }
 
     return r;
-}
-
-static inline unsigned wchar_t to_uwchar_t(wchar_t ch)
-{
-    return ch;
 }
 
 void builtin_printf_state_t::fatal_error(const wchar_t *fmt, ...)
@@ -259,7 +287,7 @@ static T string_to_scalar_type(const wchar_t *s, builtin_printf_state_t *state)
     T val;
     if (*s == L'\"' || *s == L'\'')
     {
-        unsigned wchar_t ch = *++s;
+        wchar_t ch = *++s;
         val = ch;
     }
     else
@@ -286,6 +314,9 @@ void builtin_printf_state_t::print_esc_char(wchar_t c)
             break;
         case L'c':			/* Cancel the rest of the output. */
             this->early_exit = true;
+            break;
+        case L'e':			/* Escape */
+            this->append_output(L'\x1B');
             break;
         case L'f':			/* Form feed. */
             this->append_output(L'\f');
@@ -326,7 +357,7 @@ long builtin_printf_state_t::print_esc(const wchar_t *escstart, bool octal_0)
             esc_value = esc_value * 16 + hex_to_bin(*p);
         if (esc_length == 0)
             this->fatal_error(_(L"missing hexadecimal number in escape"));
-        this->append_format_output(L"%lc", esc_value);
+        this->append_output(esc_value);
     }
     else if (is_octal_digit(*p))
     {
@@ -335,10 +366,12 @@ long builtin_printf_state_t::print_esc(const wchar_t *escstart, bool octal_0)
         extension to POSIX that is compatible with Bash 2.05b.  */
         for (esc_length = 0, p += octal_0 && *p == L'0'; esc_length < 3 && is_octal_digit(*p); ++esc_length, ++p)
             esc_value = esc_value * 8 + octal_to_bin(*p);
-        this->append_format_output(L"%c", esc_value);
+        this->append_output(esc_value);
     }
-    else if (*p && wcschr(L"\"\\abcfnrtv", *p))
+    else if (*p && wcschr(L"\"\\abcefnrtv", *p))
+    {
         print_esc_char(*p++);
+    }
     else if (*p == L'u' || *p == L'U')
     {
         wchar_t esc_char = *p;
@@ -358,9 +391,9 @@ long builtin_printf_state_t::print_esc(const wchar_t *escstart, bool octal_0)
             uni_value = uni_value * 16 + hex_to_bin(*p);
             p++;
         }
-        
+
         /* PCA GNU printf respects the limitations described in ISO N717, about which universal characters "shall not" be specified. I believe this limitation is for the benefit of compilers; I see no reason to impose it in builtin_printf.
-        
+
           If __STDC_ISO_10646__ is defined, then it means wchar_t can and does hold Unicode code points, so just use that. If not defined, use the %lc printf conversion; this probably won't do anything good if your wide character set is not Unicode, but such platforms are exceedingly rare.
         */
         if (uni_value > 0x10FFFF)
@@ -543,6 +576,16 @@ void builtin_printf_state_t::print_direc(const wchar_t *start, size_t length, wc
     }
 }
 
+/* For each character in str, set the corresponding boolean in the array to the given flag */
+static inline void modify_allowed_format_specifiers(bool ok[UCHAR_MAX + 1], const char *str, bool flag)
+{
+    for (const char *c  = str; *c != '\0'; c++)
+    {
+        unsigned char idx = static_cast<unsigned char>(*c);
+        ok[idx] = flag;
+    }
+}
+
 /* Print the text in FORMAT, using ARGV (with ARGC elements) for
    arguments to any `%' directives.
    Return the number of elements of ARGV used.  */
@@ -585,9 +628,7 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
                     break;
                 }
 
-                ok['a'] = ok['A'] = ok['c'] = ok['d'] = ok['e'] = ok['E'] =
-                        ok['f'] = ok['F'] = ok['g'] = ok['G'] = ok['i'] = ok['o'] =
-                                ok['s'] = ok['u'] = ok['x'] = ok['X'] = true;
+                modify_allowed_format_specifiers(ok, "aAcdeEfFgGiosuxX", true);
 
                 for (;; f++, direc_length++)
                 {
@@ -595,18 +636,17 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
                     {
                         case L'I':
                         case L'\'':
-                            ok['a'] = ok['A'] = ok['c'] = ok['e'] = ok['E'] =
-                                    ok['o'] = ok['s'] = ok['x'] = ok['X'] = false;
+                            modify_allowed_format_specifiers(ok, "aAceEosxX", false);
                             break;
                         case '-':
                         case '+':
                         case ' ':
                             break;
                         case L'#':
-                            ok['c'] = ok['d'] = ok['i'] = ok['s'] = ok['u'] = false;
+                            modify_allowed_format_specifiers(ok, "cdisu", false);
                             break;
                         case '0':
-                            ok['c'] = ok['s'] = false;
+                            modify_allowed_format_specifiers(ok, "cs", false);
                             break;
                         default:
                             goto no_more_flag_characters;
@@ -647,7 +687,7 @@ no_more_flag_characters:
                 {
                     ++f;
                     ++direc_length;
-                    ok['c'] = false;
+                    modify_allowed_format_specifiers(ok, "c", false);
                     if (*f == L'*')
                     {
                         ++f;
@@ -691,8 +731,8 @@ no_more_flag_characters:
                     ++f;
 
                 {
-                    unsigned wchar_t conversion = *f;
-                    if (! ok[conversion])
+                    wchar_t conversion = *f;
+                    if (conversion > 0xFF || ! ok[conversion])
                     {
                         this->fatal_error(_(L"%.*ls: invalid conversion specification"), (int)(f + 1 - direc_start), direc_start);
                         return 0;

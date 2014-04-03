@@ -22,6 +22,7 @@
 #include "sanity.h"
 #include "tokenizer.h"
 #include "reader.h"
+#include "parse_tree.h"
 
 #include "wutil.h"
 #include "history.h"
@@ -47,19 +48,81 @@ Our history format is intended to be valid YAML. Here it is:
   Newlines are replaced by \n. Backslashes are replaced by \\.
 */
 
-
-
 /** When we rewrite the history, the number of items we keep */
 #define HISTORY_SAVE_MAX (1024 * 256)
 
-/** Interval in seconds between automatic history save */
-#define SAVE_INTERVAL (5*60)
-
-/** Number of new history entries to add before automatic history save */
-#define SAVE_COUNT 5
-
 /** Whether we print timing information */
 #define LOG_TIMES 0
+
+/** Default buffer size for flushing to the history file */
+#define HISTORY_OUTPUT_BUFFER_SIZE (4096 * 4)
+
+/* Helper class for certain output. This is basically a string that allows us to ensure we only flush at record boundaries, and avoids the copying of ostringstream. Have you ever tried to implement your own streambuf? Total insanity. */
+class history_output_buffer_t
+{
+    /* A null-terminated C string */
+    std::vector<char> buffer;
+
+    /* Offset is the offset of the null terminator */
+    size_t offset;
+
+    static size_t safe_strlen(const char *s)
+    {
+        return s ? strlen(s) : 0;
+    }
+
+public:
+
+    /* Add a bit more to HISTORY_OUTPUT_BUFFER_SIZE because we flush once we've exceeded that size */
+    history_output_buffer_t() : buffer(HISTORY_OUTPUT_BUFFER_SIZE + 128, '\0'), offset(0)
+    {
+    }
+
+    /* Append one or more strings */
+    void append(const char *s1, const char *s2 = NULL, const char *s3 = NULL)
+    {
+        const char *ptrs[4] = {s1, s2, s3, NULL};
+        const size_t lengths[4] = {safe_strlen(s1), safe_strlen(s2), safe_strlen(s3), 0};
+
+        /* Determine the additional size we'll need */
+        size_t additional_length = 0;
+        for (size_t i=0; i < sizeof lengths / sizeof *lengths; i++)
+        {
+            additional_length += lengths[i];
+        }
+
+        /* Allocate that much, plus a null terminator */
+        size_t required_size = offset + additional_length + 1;
+        if (required_size > buffer.size())
+        {
+            buffer.resize(required_size, '\0');
+        }
+
+        /* Copy */
+        for (size_t i=0; ptrs[i] != NULL; i++)
+        {
+            memmove(&buffer.at(offset), ptrs[i], lengths[i]);
+            offset += lengths[i];
+        }
+
+        /* Null terminator was appended by virtue of the resize() above (or in a previous invocation). */
+        assert(buffer.at(buffer.size() - 1) == '\0');
+    }
+
+    /* Output to a given fd, resetting our buffer. Returns true on success, false on error */
+    bool flush_to_fd(int fd)
+    {
+        bool result = write_loop(fd, &buffer.at(0), offset) >= 0;
+        offset = 0;
+        return result;
+    }
+
+    /* Return how much data we've accumulated */
+    size_t output_size() const
+    {
+        return offset;
+    }
+};
 
 class time_profiler_t
 {
@@ -173,7 +236,7 @@ static void escape_yaml(std::string &str);
 /** Undoes escape_yaml */
 static void unescape_yaml(std::string &str);
 
-/* We can merge two items if they are the same command. We use the more recent timestamp and the longer list of required paths. */
+/* We can merge two items if they are the same command. We use the more recent timestamp, more recent identifier, and the longer list of required paths. */
 bool history_item_t::merge(const history_item_t &item)
 {
     bool result = false;
@@ -184,16 +247,20 @@ bool history_item_t::merge(const history_item_t &item)
         {
             this->required_paths = item.required_paths;
         }
+        if (this->identifier < item.identifier)
+        {
+            this->identifier = item.identifier;
+        }
         result = true;
     }
     return result;
 }
 
-history_item_t::history_item_t(const wcstring &str) : contents(str), creation_timestamp(time(NULL))
+history_item_t::history_item_t(const wcstring &str) : contents(str), creation_timestamp(time(NULL)), identifier(0)
 {
 }
 
-history_item_t::history_item_t(const wcstring &str, time_t when, const path_list_t &paths) : contents(str), creation_timestamp(when), required_paths(paths)
+history_item_t::history_item_t(const wcstring &str, time_t when, history_identifier_t ident) : contents(str), creation_timestamp(when), identifier(ident)
 {
 }
 
@@ -216,32 +283,28 @@ bool history_item_t::matches_search(const wcstring &term, enum history_search_ty
     }
 }
 
-/* Output our YAML history format to a file. */
-static bool write_yaml_to_file(const wcstring &wcmd, time_t timestamp, const path_list_t &required_paths, FILE *f)
+/* Append our YAML history format to the provided vector at the given offset, updating the offset */
+static void append_yaml_to_buffer(const wcstring &wcmd, time_t timestamp, const path_list_t &required_paths, history_output_buffer_t *buffer)
 {
     std::string cmd = wcs2string(wcmd);
     escape_yaml(cmd);
-    if (fprintf(f, "- cmd: %s\n", cmd.c_str()) < 0)
-        return false;
+    buffer->append("- cmd: ", cmd.c_str(), "\n");
 
-    if (fprintf(f, "   when: %ld\n", (long)timestamp) < 0)
-        return false;
+    char timestamp_str[96];
+    snprintf(timestamp_str, sizeof timestamp_str, "%ld", (long) timestamp);
+    buffer->append("   when: ", timestamp_str, "\n");
 
     if (! required_paths.empty())
     {
-        if (fputs("   paths:\n", f) < 0)
-            return false;
+        buffer->append("   paths:\n");
 
         for (path_list_t::const_iterator iter = required_paths.begin(); iter != required_paths.end(); ++iter)
         {
             std::string path = wcs2string(*iter);
             escape_yaml(path);
-
-            if (fprintf(f, "    - %s\n", path.c_str()) < 0)
-                return false;
+            buffer->append("    - ", path.c_str(), "\n");
         }
     }
-    return true;
 }
 
 // Parse a timestamp line that looks like this: spaces, "when:", spaces, timestamp, newline
@@ -355,6 +418,13 @@ static size_t offset_of_next_item_fish_2_0(const char *begin, size_t mmap_length
             bool has_timestamp = false;
             time_t timestamp;
             const char *interior_line;
+
+            /*
+             * Ensure the loop is processed at least once. Otherwise,
+             * timestamp is unitialized.
+             */
+            bool processed_once = false;
+
             for (interior_line = next_line(line_start, end - line_start);
                     interior_line != NULL && ! has_timestamp;
                     interior_line = next_line(interior_line, end - interior_line))
@@ -369,7 +439,11 @@ static size_t offset_of_next_item_fish_2_0(const char *begin, size_t mmap_length
 
                 /* Try parsing a timestamp from this line. If we succeed, the loop will break. */
                 has_timestamp = parse_timestamp(interior_line, &timestamp);
+
+                processed_once = true;
             }
+
+            assert(processed_once);
 
             /* Skip this item if the timestamp is past our cutoff. */
             if (has_timestamp && timestamp > cutoff_timestamp)
@@ -474,6 +548,7 @@ history_t & history_t::history_with_name(const wcstring &name)
 history_t::history_t(const wcstring &pname) :
     name(pname),
     first_unwritten_new_item_index(0),
+    disable_automatic_save_counter(0),
     mmap_start(NULL),
     mmap_length(0),
     mmap_file_id(kInvalidFileID),
@@ -503,6 +578,19 @@ void history_t::add(const history_item_t &item)
     {
         /* We have to add a new item */
         new_items.push_back(item);
+        save_internal_unless_disabled();
+    }
+}
+
+void history_t::save_internal_unless_disabled()
+{
+    /* This must be called while locked */
+    ASSERT_IS_LOCKED(lock);
+
+    /* Respect disable_automatic_save_counter */
+    if (disable_automatic_save_counter > 0)
+    {
+        return;
     }
 
     /* We may or may not vacuum. We try to vacuum every kVacuumFrequency items, but start the countdown at a random number so that even if the user never runs more than 25 commands, we'll eventually vacuum.  If countdown_to_vacuum is -1, it means we haven't yet picked a value for the counter. */
@@ -529,10 +617,9 @@ void history_t::add(const history_item_t &item)
     /* Update our countdown */
     assert(countdown_to_vacuum > 0);
     countdown_to_vacuum--;
-
 }
 
-void history_t::add(const wcstring &str, const path_list_t &valid_paths)
+void history_t::add(const wcstring &str, history_identifier_t ident)
 {
     time_t when = time(NULL);
     /* Big hack: do not allow timestamps equal to our birthdate. This is because we include items whose timestamps are equal to our birthdate when reading old history, so we can catch "just closed" items. But this means that we may interpret our own items, that we just wrote, as old items, if we wrote them in the same second as our birthdate.
@@ -540,7 +627,7 @@ void history_t::add(const wcstring &str, const path_list_t &valid_paths)
     if (when == this->birth_timestamp)
         when++;
 
-    this->add(history_item_t(str, when, valid_paths));
+    this->add(history_item_t(str, when, ident));
 }
 
 void history_t::remove(const wcstring &str)
@@ -552,7 +639,7 @@ void history_t::remove(const wcstring &str)
     size_t idx = new_items.size();
     while (idx--)
     {
-        if (new_items[idx].str() == str)
+        if (new_items.at(idx).str() == str)
         {
             new_items.erase(new_items.begin() + idx);
 
@@ -566,15 +653,43 @@ void history_t::remove(const wcstring &str)
     assert(first_unwritten_new_item_index <= new_items.size());
 }
 
+void history_t::set_valid_file_paths(const wcstring_list_t &valid_file_paths, history_identifier_t ident)
+{
+    /* 0 identifier is used to mean "not necessary" */
+    if (ident == 0)
+    {
+        return;
+    }
+
+    scoped_lock locker(lock);
+
+    /* Look for an item with the given identifier. It is likely to be at the end of new_items */
+    for (history_item_list_t::reverse_iterator iter = new_items.rbegin(); iter != new_items.rend(); iter++)
+    {
+        if (iter->identifier == ident)
+        {
+            /* Found it */
+            iter->required_paths = valid_file_paths;
+            break;
+        }
+    }
+}
+
 void history_t::get_string_representation(wcstring &result, const wcstring &separator)
 {
     scoped_lock locker(lock);
 
     bool first = true;
 
+    std::set<wcstring> seen;
+
     /* Append new items. Note that in principle we could use const_reverse_iterator, but we do not because reverse_iterator is not convertible to const_reverse_iterator ( http://github.com/fish-shell/fish-shell/issues/431 ) */
-    for (std::vector<history_item_t>::reverse_iterator iter=new_items.rbegin(); iter < new_items.rend(); ++iter)
+    for (history_item_list_t::reverse_iterator iter=new_items.rbegin(); iter < new_items.rend(); ++iter)
     {
+        /* Skip duplicates */
+        if (! seen.insert(iter->str()).second)
+            continue;
+
         if (! first)
             result.append(separator);
         result.append(iter->str());
@@ -583,10 +698,15 @@ void history_t::get_string_representation(wcstring &result, const wcstring &sepa
 
     /* Append old items */
     load_old_if_needed();
-    for (std::vector<size_t>::reverse_iterator iter = old_item_offsets.rbegin(); iter != old_item_offsets.rend(); ++iter)
+    for (std::deque<size_t>::reverse_iterator iter = old_item_offsets.rbegin(); iter != old_item_offsets.rend(); ++iter)
     {
         size_t offset = *iter;
         const history_item_t item = history_t::decode_item(mmap_start + offset, mmap_length - offset, mmap_type);
+
+        /* Skip duplicates */
+        if (! seen.insert(item.str()).second)
+            continue;
+
         if (! first)
             result.append(separator);
         result.append(item.str());
@@ -745,7 +865,9 @@ history_item_t history_t::decode_item_fish_2_0(const char *base, size_t len)
         }
     }
 done:
-    return history_item_t(cmd, when, paths);
+    history_item_t result(cmd, when);
+    result.required_paths.swap(paths);
+    return result;
 }
 
 history_item_t history_t::decode_item(const char *base, size_t len, history_file_type_t type)
@@ -913,7 +1035,7 @@ void history_t::populate_from_mmap(void)
 }
 
 /* Do a private, read-only map of the entirety of a history file with the given name. Returns true if successful. Returns the mapped memory region by reference. */
-static bool map_file(const wcstring &name, const char **out_map_start, size_t *out_map_len, file_id_t *file_id)
+bool history_t::map_file(const wcstring &name, const char **out_map_start, size_t *out_map_len, file_id_t *file_id)
 {
     bool result = false;
     wcstring filename = history_filename(name, L"");
@@ -927,22 +1049,25 @@ static bool map_file(const wcstring &name, const char **out_map_start, size_t *o
             if (file_id != NULL)
                 *file_id = history_file_identify(fd);
 
-            /* Take a read lock to guard against someone else appending. This is released when the file is closed (below). We will read the file after taking the lock, but that's not a problem, because we never modify already written data. In short, the purpose of this lock is to ensure we don't see the file size change mid-update. */
-            if (history_file_lock(fd, F_RDLCK))
+            /* Take a read lock to guard against someone else appending. This is released when the file is closed (below). We will read the file after releasing the lock, but that's not a problem, because we never modify already written data. In short, the purpose of this lock is to ensure we don't see the file size change mid-update.
+
+                We may fail to lock (e.g. on lockless NFS - see https://github.com/fish-shell/fish-shell/issues/685 ). In that case, we proceed as if it did not fail. The risk is that we may get an incomplete history item; this is unlikely because we only treat an item as valid if it has a terminating newline.
+
+                Simulate a failing lock in chaos_mode
+            */
+            if (! chaos_mode) history_file_lock(fd, F_RDLCK);
+            off_t len = lseek(fd, 0, SEEK_END);
+            if (len != (off_t)-1)
             {
-                off_t len = lseek(fd, 0, SEEK_END);
-                if (len != (off_t)-1)
+                size_t mmap_length = (size_t)len;
+                if (lseek(fd, 0, SEEK_SET) == 0)
                 {
-                    size_t mmap_length = (size_t)len;
-                    if (lseek(fd, 0, SEEK_SET) == 0)
+                    char *mmap_start;
+                    if ((mmap_start = (char *)mmap(0, mmap_length, PROT_READ, MAP_PRIVATE, fd, 0)) != MAP_FAILED)
                     {
-                        char *mmap_start;
-                        if ((mmap_start = (char *)mmap(0, mmap_length, PROT_READ, MAP_PRIVATE, fd, 0)) != MAP_FAILED)
-                        {
-                            result = true;
-                            *out_map_start = mmap_start;
-                            *out_map_len = mmap_length;
-                        }
+                        result = true;
+                        *out_map_start = mmap_start;
+                        *out_map_len = mmap_length;
                     }
                 }
             }
@@ -1009,14 +1134,14 @@ bool history_search_t::go_backwards()
         return false;
 
     const bool main_thread = is_main_thread();
-    
+
     while (++idx < max_idx)
     {
         if (main_thread ? reader_interrupted() : reader_thread_job_is_stale())
         {
             return false;
         }
-    
+
         const history_item_t item = history->item_at_index(idx);
         /* We're done if it's empty or we cancelled */
         if (item.empty())
@@ -1104,7 +1229,7 @@ static void unescape_yaml(std::string &str)
     {
         // Operate on a const version of str, to avoid needless COWs that at() does.
         const std::string &const_str = str;
-        
+
         // Look for a backslash
         size_t backslash = const_str.find('\\', cursor);
         if (backslash == std::string::npos || backslash + 1 >= size)
@@ -1188,7 +1313,7 @@ bool history_t::save_internal_via_rewrite()
     /* This must be called while locked */
     ASSERT_IS_LOCKED(lock);
 
-    bool ok = true;
+    bool ok = false;
 
     wcstring tmp_name_template = history_filename(name, L".XXXXXX");
     if (! tmp_name_template.empty())
@@ -1197,7 +1322,7 @@ bool history_t::save_internal_via_rewrite()
         history_lru_cache_t lru(HISTORY_SAVE_MAX);
 
         /* Insert old items in, from old to new. Merge them with our new items, inserting items with earlier timestamps first. */
-        std::vector<history_item_t>::const_iterator new_item_iter = new_items.begin();
+        history_item_list_t::const_iterator new_item_iter = new_items.begin();
 
         /* Map in existing items (which may have changed out from underneath us, so don't trust our old mmap'd data) */
         const char *local_mmap_start = NULL;
@@ -1266,53 +1391,40 @@ bool history_t::save_internal_via_rewrite()
 
         if (out_fd >= 0)
         {
-            /* Success */
-            FILE *out = fdopen(out_fd, "w");
-            if (out)
+            /* Write them out */
+            bool errored = false;
+            history_output_buffer_t buffer;
+            for (history_lru_cache_t::iterator iter = lru.begin(); iter != lru.end(); ++iter)
             {
-                /* Be block buffered. In chaos mode, choose a tiny buffer so as to magnify the effects of race conditions. Otherwise, use the default buffer */
-                setvbuf(out, NULL, _IOFBF, chaos_mode ? 1 : 0);
-
-                /* Write them out */
-                for (history_lru_cache_t::iterator iter = lru.begin(); iter != lru.end(); ++iter)
+                const history_lru_node_t *node = *iter;
+                append_yaml_to_buffer(node->key, node->timestamp, node->required_paths, &buffer);
+                if (buffer.output_size() >= HISTORY_OUTPUT_BUFFER_SIZE && ! buffer.flush_to_fd(out_fd))
                 {
-                    const history_lru_node_t *node = *iter;
-                    if (! write_yaml_to_file(node->key, node->timestamp, node->required_paths, out))
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-
-                if (0 == fclose(out))
-                {
-                    /* fclose closed out_fd, so mark it as -1 so we don't try to close it later */
-                    out_fd = -1;
-                }
-                else
-                {
-                    /* error on close */
-                    ok = false;
-                }
-
-                if (! ok)
-                {
-                    /*
-                      This message does not have high enough priority to
-                      be shown by default.
-                    */
-                    debug(2, L"Error when writing history file");
-                }
-                else
-                {
-                    wcstring new_name = history_filename(name, wcstring());
-                    wrename(tmp_name, new_name);
+                    errored = true;
+                    break;
                 }
             }
-        }
 
-        if (out_fd >= 0)
+            if (! errored && buffer.flush_to_fd(out_fd))
+            {
+                ok = true;
+            }
+
+            if (! ok)
+            {
+                /*
+                  This message does not have high enough priority to
+                  be shown by default.
+                */
+                debug(2, L"Error when writing history file");
+            }
+            else
+            {
+                wcstring new_name = history_filename(name, wcstring());
+                wrename(tmp_name, new_name);
+            }
             close(out_fd);
+        }
 
         signal_unblock();
 
@@ -1362,61 +1474,49 @@ bool history_t::save_internal_via_appending()
         if (history_file_identify(out_fd) != mmap_file_id)
             file_changed = true;
 
-        /* Exclusive lock on the entire file. This is released when we close the file (below). */
-        if (history_file_lock(out_fd, F_WRLCK))
+        /* Exclusive lock on the entire file. This is released when we close the file (below). This may fail on (e.g.) lockless NFS. If so, proceed as if it did not fail; the risk is that we may get interleaved history items, which is considered better than no history, or forcing everything through the slow copy-move mode. We try to minimize this possibility by writing with O_APPEND.
+
+           Simulate a failing lock in chaos_mode
+        */
+        if (! chaos_mode) history_file_lock(out_fd, F_WRLCK);
+
+        /* We (hopefully successfully) took the exclusive lock. Append to the file.
+           Note that this is sketchy for a few reasons:
+             - Another shell may have appended its own items with a later timestamp, so our file may no longer be sorted by timestamp.
+             - Another shell may have appended the same items, so our file may now contain duplicates.
+
+           We cannot modify any previous parts of our file, because other instances may be reading those portions. We can only append.
+
+           Originally we always rewrote the file on saving, which avoided both of these problems. However, appending allows us to save history after every command, which is nice!
+
+           Periodically we "clean up" the file by rewriting it, so that most of the time it doesn't have duplicates, although we don't yet sort by timestamp (the timestamp isn't really used for much anyways).
+        */
+
+        /* So far so good. Write all items at or after first_unwritten_new_item_index */
+
+        bool errored = false;
+        history_output_buffer_t buffer;
+        while (first_unwritten_new_item_index < new_items.size())
         {
-            /* We successfully took the exclusive lock. Append to the file.
-               Note that this is sketchy for a few reasons:
-                 - Another shell may have appended its own items with a later timestamp, so our file may no longer be sorted by timestamp.
-                 - Another shell may have appended the same items, so our file may now contain duplicates.
-
-               We cannot modify any previous parts of our file, because other instances may be reading those portions. We can only append.
-
-               Originally we always rewrote the file on saving, which avoided both of these problems. However, appending allows us to save history after every command, which is nice!
-
-               Periodically we "clean up" the file by rewriting it, so that most of the time it doesn't have duplicates, although we don't yet sort by timestamp (the timestamp isn't really used for much anyways).
-            */
-
-            FILE *out = fdopen(out_fd, "a");
-            if (out)
+            const history_item_t &item = new_items.at(first_unwritten_new_item_index);
+            append_yaml_to_buffer(item.str(), item.timestamp(), item.get_required_paths(), &buffer);
+            if (buffer.output_size() >= HISTORY_OUTPUT_BUFFER_SIZE)
             {
-                /* Be block buffered. In chaos mode, choose a tiny buffer so as to magnify the effects of race conditions. Otherwise, use the default buffer */
-                setvbuf(out, NULL, _IOFBF, chaos_mode ? 1 : 0);
-
-                bool errored = false;
-
-                /* Write all items at or after first_unwritten_new_item_index */
-                while (first_unwritten_new_item_index < new_items.size())
-                {
-                    const history_item_t &item = new_items.at(first_unwritten_new_item_index);
-                    if (! write_yaml_to_file(item.str(), item.timestamp(), item.get_required_paths(), out))
-                    {
-                        errored = true;
-                        break;
-                    }
-
-                    /* We wrote this item, hooray */
-                    first_unwritten_new_item_index++;
-                }
-
-                if (0 == fclose(out))
-                {
-                    /* fclose just closed our out_fd; mark it as -1 so we don't re-close it */
-                    out_fd = -1;
-                }
-                else
-                {
-                    errored = true;
-                }
-
-                /* We're OK if we did not error */
-                ok = ! errored;
+                errored = ! buffer.flush_to_fd(out_fd);
+                if (errored) break;
             }
-        }
-    }
 
-    if (out_fd >= 0)
+            /* We wrote this item, hooray */
+            first_unwritten_new_item_index++;
+        }
+
+        if (! errored && buffer.flush_to_fd(out_fd))
+        {
+            ok = true;
+        }
+
         close(out_fd);
+    }
 
     signal_unblock();
 
@@ -1467,6 +1567,22 @@ void history_t::save_and_vacuum(void)
     scoped_lock locker(lock);
     this->save_internal(true);
 }
+
+void history_t::disable_automatic_saving()
+{
+    scoped_lock locker(lock);
+    disable_automatic_save_counter++;
+    assert(disable_automatic_save_counter != 0); // overflow!
+}
+
+void history_t::enable_automatic_saving()
+{
+    scoped_lock locker(lock);
+    assert(disable_automatic_save_counter > 0); //underflow
+    disable_automatic_save_counter--;
+    save_internal_unless_disabled();
+}
+
 
 void history_t::clear(void)
 {
@@ -1635,11 +1751,10 @@ bool file_detection_context_t::paths_are_valid(const path_list_t &paths)
     return perform_file_detection(false) > 0;
 }
 
-file_detection_context_t::file_detection_context_t(history_t *hist, const wcstring &cmd) :
+file_detection_context_t::file_detection_context_t(history_t *hist, history_identifier_t ident) :
     history(hist),
-    command(cmd),
-    when(time(NULL)),
-    working_directory(get_working_directory())
+    working_directory(env_get_pwd_slash()),
+    history_item_identifier(ident)
 {
 }
 
@@ -1652,8 +1767,13 @@ static int threaded_perform_file_detection(file_detection_context_t *ctx)
 
 static void perform_file_detection_done(file_detection_context_t *ctx, int success)
 {
-    /* Now that file detection is done, create the history item */
-    ctx->history->add(ctx->command, ctx->valid_paths);
+    ASSERT_IS_MAIN_THREAD();
+
+    /* Now that file detection is done, update the history item with the valid file paths */
+    ctx->history->set_valid_file_paths(ctx->valid_paths, ctx->history_item_identifier);
+
+    /* Allow saving again */
+    ctx->history->enable_automatic_saving();
 
     /* Done with the context. */
     delete ctx;
@@ -1663,7 +1783,9 @@ static bool string_could_be_path(const wcstring &potential_path)
 {
     // Assume that things with leading dashes aren't paths
     if (potential_path.empty() || potential_path.at(0) == L'-')
+    {
         return false;
+    }
     return true;
 }
 
@@ -1672,42 +1794,72 @@ void history_t::add_with_file_detection(const wcstring &str)
     ASSERT_IS_MAIN_THREAD();
     path_list_t potential_paths;
 
-    /* Hack hack hack - if the command is likely to trigger an exit, then don't do background file detection, because we won't be able to write it to our history file before we exit. */
+    /* Find all arguments that look like they could be file paths */
     bool impending_exit = false;
+    parse_node_tree_t tree;
+    parse_tree_from_string(str, parse_flag_none, &tree, NULL);
+    size_t count = tree.size();
 
-    tokenizer_t tokenizer(str.c_str(), TOK_SQUASH_ERRORS);
-    for (; tok_has_next(&tokenizer); tok_next(&tokenizer))
+    for (size_t i=0; i < count; i++)
     {
-        int type = tok_last_type(&tokenizer);
-        if (type == TOK_STRING)
+        const parse_node_t &node = tree.at(i);
+        if (! node.has_source())
         {
-            const wchar_t *token_cstr = tok_last(&tokenizer);
-            if (token_cstr)
-            {
-                wcstring potential_path = token_cstr;
-                if (unescape_string(potential_path, false) && string_could_be_path(potential_path))
-                {
-                    potential_paths.push_back(potential_path);
+            continue;
+        }
 
-                    /* What a hack! */
-                    impending_exit = impending_exit || contains(potential_path, L"exec", L"exit", L"reboot");
-                }
+        if (node.type == symbol_argument)
+        {
+            wcstring potential_path = node.get_source(str);
+            bool unescaped = unescape_string_in_place(&potential_path, UNESCAPE_DEFAULT);
+            if (unescaped && string_could_be_path(potential_path))
+            {
+                potential_paths.push_back(potential_path);
+            }
+        }
+        else if (node.type == symbol_plain_statement)
+        {
+            /* Hack hack hack - if the command is likely to trigger an exit, then don't do background file detection, because we won't be able to write it to our history file before we exit. */
+            if (tree.decoration_for_plain_statement(node) == parse_statement_decoration_exec)
+            {
+                impending_exit = true;
+            }
+
+            wcstring command;
+            tree.command_for_plain_statement(node, str, &command);
+            unescape_string_in_place(&command, UNESCAPE_DEFAULT);
+            if (contains(command, L"exit", L"reboot"))
+            {
+                impending_exit = true;
             }
         }
     }
 
-    if (potential_paths.empty() || impending_exit)
+    /* If we got a path, we'll perform file detection for autosuggestion hinting */
+    history_identifier_t identifier = 0;
+    if (! potential_paths.empty() && ! impending_exit)
     {
-        this->add(str);
-    }
-    else
-    {
-        /* We have some paths. Make a context. */
-        file_detection_context_t *context = new file_detection_context_t(this, str);
+        /* Grab the next identifier */
+        static history_identifier_t sLastIdentifier = 0;
+        identifier = ++sLastIdentifier;
 
-        /* Store the potential paths. Reverse them to put them in the same order as in the command. */
+        /* Create a new detection context */
+        file_detection_context_t *context = new file_detection_context_t(this, identifier);
         context->potential_paths.swap(potential_paths);
+
+        /* Prevent saving until we're done, so we have time to get the paths */
+        this->disable_automatic_saving();
+
+        /* Kick it off. Even though we haven't added the item yet, it updates the item on the main thread, so we can't race */
         iothread_perform(threaded_perform_file_detection, perform_file_detection_done, context);
     }
-}
 
+    /* Actually add the item to the history */
+    this->add(str, identifier);
+
+    /* If we think we're about to exit, save immediately, regardless of any disabling. This may cause us to lose file hinting for some commands, but it beats losing history items */
+    if (impending_exit)
+    {
+        this->save();
+    }
+}

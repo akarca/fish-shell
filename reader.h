@@ -16,10 +16,57 @@
 #include "io.h"
 #include "common.h"
 #include "complete.h"
+#include "highlight.h"
 
 class parser_t;
 class completion_t;
 class history_t;
+
+/* Helper class for storing a command line */
+class editable_line_t
+{
+public:
+
+    /** The command line */
+    wcstring text;
+
+    /** The current position of the cursor in the command line */
+    size_t position;
+
+    const wcstring &get_text() const
+    {
+        return text;
+    }
+
+    /* Gets the length of the text */
+    size_t size() const
+    {
+        return text.size();
+    }
+
+    bool empty() const
+    {
+        return text.empty();
+    }
+
+    void clear()
+    {
+        text.clear();
+        position = 0;
+    }
+
+    wchar_t at(size_t idx)
+    {
+        return text.at(idx);
+    }
+
+    editable_line_t() : text(), position(0)
+    {
+    }
+
+    /* Inserts the string at the cursor position */
+    void insert_string(const wcstring &str);
+};
 
 /**
   Read commands from \c fd until encountering EOF
@@ -45,6 +92,9 @@ void reader_init();
    Destroy and free resources used by the reader
 */
 void reader_destroy();
+
+/** Restore the term mode at startup */
+void restore_term_mode();
 
 /**
    Returns the filename of the file currently read
@@ -111,6 +161,13 @@ void reader_set_buffer(const wcstring &b, size_t p);
 */
 size_t reader_get_cursor_pos();
 
+
+/**
+   Get the current selection range in the command line.
+   Returns false if there is no active selection, true otherwise.
+*/
+bool reader_get_selection(size_t *start, size_t *len);
+
 /**
    Return the value of the interrupted flag, which is set by the sigint
    handler, and clear it if it was set.
@@ -163,14 +220,14 @@ void reader_pop();
    - The command to be completed as a null terminated array of wchar_t
    - An array_list_t in which completions will be inserted.
 */
-typedef void (*complete_function_t)(const wcstring &, std::vector<completion_t> &, completion_request_flags_t, wcstring_list_t * lst);
+typedef void (*complete_function_t)(const wcstring &, std::vector<completion_t> &, completion_request_flags_t);
 void reader_set_complete_function(complete_function_t);
 
 /**
  The type of a highlight function.
  */
 class env_vars_snapshot_t;
-typedef void (*highlight_function_t)(const wcstring &, std::vector<int> &, size_t, wcstring_list_t *, const env_vars_snapshot_t &vars);
+typedef void (*highlight_function_t)(const wcstring &, std::vector<highlight_spec_t> &, size_t, wcstring_list_t *, const env_vars_snapshot_t &vars);
 
 /**
  Specify function for syntax highlighting. The function must take these arguments:
@@ -204,18 +261,17 @@ void reader_set_right_prompt(const wcstring &prompt);
 /** Sets whether autosuggesting is allowed. */
 void reader_set_allow_autosuggesting(bool flag);
 
+/** Sets whether abbreviation expansion is performed. */
+void reader_set_expand_abbreviations(bool flag);
+
+
 /** Sets whether the reader should exit on ^C. */
 void reader_set_exit_on_interrupt(bool flag);
 
 /**
    Returns true if the shell is exiting, 0 otherwise.
 */
-int exit_status();
-
-/**
-   Replace the current token with the specified string
-*/
-void reader_replace_current_token(const wchar_t *new_token);
+bool shell_is_exiting();
 
 /**
    The readers interrupt signal handler. Cancels all currently running blocks.
@@ -236,15 +292,25 @@ int reader_shell_test(const wchar_t *b);
 /**
    Test whether the interactive reader is in search mode.
 
-   \return o if not in search mode, 1 if in search mode and -1 if not in interactive mode
+   \return 0 if not in search mode, 1 if in search mode and -1 if not in interactive mode
  */
 int reader_search_mode();
+
+/**
+   Test whether the interactive reader has visible pager contents.
+
+   \return 0 if it has pager contents, 1 if it does not have pager contents, and -1 if not in interactive mode
+ */
+int reader_has_pager_contents();
+
 
 /* Given a command line and an autosuggestion, return the string that gets shown to the user. Exposed for testing purposes only. */
 wcstring combine_command_and_autosuggestion(const wcstring &cmdline, const wcstring &autosuggestion);
 
+/* Expand abbreviations at the given cursor position. Exposed for testing purposes only. */
+bool reader_expand_abbreviation_in_command(const wcstring &cmdline, size_t cursor_pos, wcstring *output);
+
 /* Apply a completion string. Exposed for testing only. */
 wcstring completion_apply_to_command_line(const wcstring &val_str, complete_flags_t flags, const wcstring &command_line, size_t *inout_cursor_pos, bool append_only);
-
 
 #endif

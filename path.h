@@ -73,12 +73,12 @@ bool path_can_be_implicit_cd(const wcstring &path,
  */
 void path_make_canonical(wcstring &path);
 
+/** Check if two paths are equivalent, which means to ignore runs of multiple slashes (or trailing slashes) */
+bool paths_are_equivalent(const wcstring &p1, const wcstring &p2);
+
 bool path_is_valid(const wcstring &path, const wcstring &working_directory);
 
 /** Returns whether the two paths refer to the same file */
 bool paths_are_same_file(const wcstring &path1, const wcstring &path2);
-
-/* Returns the current working directory as returned by wgetcwd */
-wcstring get_working_directory(void);
 
 #endif
