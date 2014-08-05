@@ -59,17 +59,34 @@
 #include "output.h"
 #include "intern.h"
 #include <vector>
+#include <algorithm>
+
+#define DEFAULT_TERM L"ansi"
+#define MAX_INPUT_FUNCTION_ARGS 20
 
 /**
    Struct representing a keybinding. Returned by input_get_mappings.
  */
+
 struct input_mapping_t
 {
     wcstring seq; /**< Character sequence which generates this event */
-    wcstring command; /**< command that should be evaluated by this mapping */
+    wcstring_list_t commands; /**< commands that should be evaluated by this mapping */
 
+    /* We wish to preserve the user-specified order. This is just an incrementing value. */
+    unsigned int specification_order;
 
-    input_mapping_t(const wcstring &s, const wcstring &c) : seq(s), command(c) {}
+    wcstring mode; /**< mode in which this command should be evaluated */
+    wcstring sets_mode; /** new mode that should be switched to after command evaluation */
+
+    input_mapping_t(const wcstring &s, const std::vector<wcstring> &c,
+                    const wcstring &m = DEFAULT_BIND_MODE,
+                    const wcstring &sm = DEFAULT_BIND_MODE) : seq(s), commands(c), mode(m), sets_mode(sm)
+    {
+        static unsigned int s_last_input_mapping_specification_order = 0;
+        specification_order = ++s_last_input_mapping_specification_order;
+
+    }
 };
 
 /**
@@ -79,7 +96,6 @@ struct terminfo_mapping_t
 {
     const wchar_t *name; /**< Name of key */
     const char *seq; /**< Character sequence generated on keypress. Constant string. */
-
 };
 
 
@@ -102,6 +118,7 @@ static const wchar_t * const name_arr[] =
     L"yank",
     L"yank-pop",
     L"complete",
+    L"complete-and-search",
     L"beginning-of-history",
     L"end-of-history",
     L"backward-kill-line",
@@ -109,25 +126,44 @@ static const wchar_t * const name_arr[] =
     L"kill-word",
     L"backward-kill-word",
     L"backward-kill-path-component",
-    L"dump-functions",
     L"history-token-search-backward",
     L"history-token-search-forward",
     L"self-insert",
     L"transpose-chars",
     L"transpose-words",
-    L"null",
-    L"eof",
+    L"upcase-word",
+    L"downcase-word",
+    L"capitalize-word",
     L"vi-arg-digit",
+    L"vi-delete-to",
     L"execute",
     L"beginning-of-buffer",
     L"end-of-buffer",
     L"repaint",
+    L"force-repaint",
     L"up-line",
     L"down-line",
     L"suppress-autosuggestion",
-    L"accept-autosuggestion"
+    L"accept-autosuggestion",
+    L"begin-selection",
+    L"end-selection",
+    L"kill-selection",
+    L"forward-jump",
+    L"backward-jump",
+    L"and",
+    L"cancel"
+};
+
+wcstring describe_char(wint_t c)
+{
+    wchar_t initial_cmd_char = R_BEGINNING_OF_LINE;
+    size_t name_count = sizeof name_arr / sizeof *name_arr;
+    if (c >= initial_cmd_char && c < initial_cmd_char + name_count)
+    {
+        return format_string(L"%02x (%ls)", c, name_arr[c - initial_cmd_char]);
+    }
+    return format_string(L"%02x", c);
 }
-;
 
 /**
    Description of each supported input function
@@ -188,6 +224,7 @@ static const wchar_t code_arr[] =
     R_YANK,
     R_YANK_POP,
     R_COMPLETE,
+    R_COMPLETE_AND_SEARCH,
     R_BEGINNING_OF_HISTORY,
     R_END_OF_HISTORY,
     R_BACKWARD_KILL_LINE,
@@ -195,25 +232,33 @@ static const wchar_t code_arr[] =
     R_KILL_WORD,
     R_BACKWARD_KILL_WORD,
     R_BACKWARD_KILL_PATH_COMPONENT,
-    R_DUMP_FUNCTIONS,
     R_HISTORY_TOKEN_SEARCH_BACKWARD,
     R_HISTORY_TOKEN_SEARCH_FORWARD,
     R_SELF_INSERT,
     R_TRANSPOSE_CHARS,
     R_TRANSPOSE_WORDS,
-    R_NULL,
-    R_EOF,
+    R_UPCASE_WORD,
+    R_DOWNCASE_WORD,
+    R_CAPITALIZE_WORD,
     R_VI_ARG_DIGIT,
+    R_VI_DELETE_TO,
     R_EXECUTE,
     R_BEGINNING_OF_BUFFER,
     R_END_OF_BUFFER,
     R_REPAINT,
+    R_FORCE_REPAINT,
     R_UP_LINE,
     R_DOWN_LINE,
     R_SUPPRESS_AUTOSUGGESTION,
-    R_ACCEPT_AUTOSUGGESTION
-}
-;
+    R_ACCEPT_AUTOSUGGESTION,
+    R_BEGIN_SELECTION,
+    R_END_SELECTION,
+    R_KILL_SELECTION,
+    R_FORWARD_JUMP,
+    R_BACKWARD_JUMP,
+    R_AND,
+    R_CANCEL
+};
 
 /** Mappings for the current input mode */
 static std::vector<input_mapping_t> mapping_list;
@@ -240,28 +285,111 @@ static bool is_init = false;
  */
 static void input_terminfo_init();
 
+static wchar_t input_function_args[MAX_INPUT_FUNCTION_ARGS];
+static bool input_function_status;
+static int input_function_args_index = 0;
 
 /**
-   Returns the function description for the given function code.
+    Return the current bind mode
 */
+wcstring input_get_bind_mode()
+{
+    env_var_t mode = env_get_string(FISH_BIND_MODE_VAR);
+    return mode.missing() ? DEFAULT_BIND_MODE : mode;
+}
 
-void input_mapping_add(const wchar_t *sequence, const wchar_t *command)
+/**
+    Set the current bind mode
+*/
+void input_set_bind_mode(const wcstring &bm)
+{
+    env_set(FISH_BIND_MODE_VAR, bm.c_str(), ENV_GLOBAL);
+}
+
+
+/**
+    Returns the arity of a given input function
+*/
+int input_function_arity(int function)
+{
+    switch (function)
+    {
+        case R_FORWARD_JUMP:
+        case R_BACKWARD_JUMP:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/**
+    Sets the return status of the most recently executed input function
+*/
+void input_function_set_status(bool status)
+{
+    input_function_status = status;
+}
+
+/**
+    Returns the nth argument for a given input function
+*/
+wchar_t input_function_get_arg(int index)
+{
+    return input_function_args[index];
+}
+
+/* Helper function to compare the lengths of sequences */
+static bool length_is_greater_than(const input_mapping_t &m1, const input_mapping_t &m2)
+{
+    return m1.seq.size() > m2.seq.size();
+}
+
+static bool specification_order_is_less_than(const input_mapping_t &m1, const input_mapping_t &m2)
+{
+    return m1.specification_order < m2.specification_order;
+}
+
+/* Inserts an input mapping at the correct position. We sort them in descending order by length, so that we test longer sequences first. */
+static void input_mapping_insert_sorted(const input_mapping_t &new_mapping)
+{
+    std::vector<input_mapping_t>::iterator loc = std::lower_bound(mapping_list.begin(), mapping_list.end(), new_mapping, length_is_greater_than);
+    mapping_list.insert(loc, new_mapping);
+}
+
+/* Adds an input mapping */
+void input_mapping_add(const wchar_t *sequence, const wchar_t **commands, size_t commands_len,
+                       const wchar_t *mode, const wchar_t *sets_mode)
 {
     CHECK(sequence,);
-    CHECK(command,);
+    CHECK(commands,);
+    CHECK(mode,);
+    CHECK(sets_mode,);
 
-    //  debug( 0, L"Add mapping from %ls to %ls", escape(sequence, 1), escape(command, 1 ) );
+    // debug( 0, L"Add mapping from %ls to %ls in mode %ls", escape(sequence, 1), escape(command, 1 ), mode);
+
+    // remove existing mappings with this sequence
+    const wcstring_list_t commands_vector(commands, commands + commands_len);
 
     for (size_t i=0; i<mapping_list.size(); i++)
     {
         input_mapping_t &m = mapping_list.at(i);
-        if (m.seq == sequence)
+        if (m.seq == sequence && m.mode == mode)
         {
-            m.command = command;
+            m.commands = commands_vector;
+            m.sets_mode = sets_mode;
             return;
         }
     }
-    mapping_list.push_back(input_mapping_t(sequence, command));
+
+    // add a new mapping, using the next order
+    const input_mapping_t new_mapping = input_mapping_t(sequence, commands_vector, mode, sets_mode);
+    input_mapping_insert_sorted(new_mapping);
+}
+
+void input_mapping_add(const wchar_t *sequence, const wchar_t *command,
+                       const wchar_t *mode, const wchar_t *sets_mode)
+{
+    input_mapping_add(sequence, &command, 1, mode, sets_mode);
 }
 
 /**
@@ -340,13 +468,29 @@ int input_init()
 
     input_common_init(&interrupt_handler);
 
+    const env_var_t term = env_get_string(L"TERM");
     int errret;
     if (setupterm(0, STDOUT_FILENO, &errret) == ERR)
     {
         debug(0, _(L"Could not set up terminal"));
-        exit_without_destructors(1);
+        if (errret == 0)
+        {
+            debug(0, _(L"Check that your terminal type, '%ls', is supported on this system"),
+                  term.c_str());
+            debug(0, _(L"Attempting to use '%ls' instead"), DEFAULT_TERM);
+            env_set(L"TERM", DEFAULT_TERM, ENV_GLOBAL | ENV_EXPORT);
+            const std::string default_term = wcs2string(DEFAULT_TERM);
+            if (setupterm(const_cast<char *>(default_term.c_str()), STDOUT_FILENO, &errret) == ERR)
+            {
+                debug(0, _(L"Could not set up terminal"));
+                exit_without_destructors(1);
+            }
+        }
+        else
+        {
+            exit_without_destructors(1);
+        }
     }
-    const env_var_t term = env_get_string(L"TERM");
     assert(! term.missing());
     output_set_term(term);
 
@@ -384,55 +528,69 @@ void input_destroy()
     }
 }
 
+void input_function_push_arg(wchar_t arg)
+{
+    input_function_args[input_function_args_index++] = arg;
+}
+
+wchar_t input_function_pop_arg()
+{
+    return input_function_args[--input_function_args_index];
+}
+
+void input_function_push_args(int code)
+{
+    int arity = input_function_arity(code);
+    for (int i = 0; i < arity; i++)
+    {
+        input_function_push_arg(input_common_readch(0));
+    }
+}
+
 /**
    Perform the action of the specified binding
 */
-static wint_t input_exec_binding(const input_mapping_t &m, const wcstring &seq)
+static void input_mapping_execute(const input_mapping_t &m)
 {
-    wchar_t code = input_function_get_code(m.command);
-    if (code != (wchar_t)-1)
+    /* By default input functions always succeed */
+    input_function_status = true;
+
+    size_t idx = m.commands.size();
+    while (idx--)
     {
-        switch (code)
+        wcstring command = m.commands.at(idx);
+        wchar_t code = input_function_get_code(command);
+        if (code != (wchar_t)-1)
         {
-
-            case R_SELF_INSERT:
-            {
-                return seq[0];
-            }
-
-            default:
-            {
-                return code;
-            }
-
+            input_function_push_args(code);
         }
     }
-    else
+
+    idx = m.commands.size();
+    while (idx--)
     {
+        wcstring command = m.commands.at(idx);
+        wchar_t code = input_function_get_code(command);
+        if (code != (wchar_t)-1)
+        {
+            input_unreadch(code);
+        }
+        else
+        {
+            /*
+             This key sequence is bound to a command, which
+             is sent to the parser for evaluation.
+             */
+            int last_status = proc_get_last_status();
+            parser_t::principal_parser().eval(command.c_str(), io_chain_t(), TOP);
 
-        /*
-          This key sequence is bound to a command, which
-          is sent to the parser for evaluation.
-        */
-        int last_status = proc_get_last_status();
+            proc_set_last_status(last_status);
 
-        parser_t::principal_parser().eval(m.command.c_str(), io_chain_t(), TOP);
-
-        proc_set_last_status(last_status);
-
-        /*
-          We still need to return something to the caller, R_NULL
-          tells the reader that no key press needs to be handled,
-          and no repaint is needed.
-
-          Bindings that produce output should emit a R_REPAINT
-          function by calling 'commandline -f repaint' to tell
-          fish that a repaint is in order.
-        */
-
-        return R_NULL;
-
+            input_unreadch(R_NULL);
+        }
     }
+
+    input_set_bind_mode(m.sets_mode.c_str());
 }
 
 
@@ -440,34 +598,29 @@ static wint_t input_exec_binding(const input_mapping_t &m, const wcstring &seq)
 /**
    Try reading the specified function mapping
 */
-static wint_t input_try_mapping(const input_mapping_t &m)
+static bool input_mapping_is_match(const input_mapping_t &m)
 {
-    wint_t c=0;
+    wint_t c = 0;
     int j;
 
-    /*
-      Check if the actual function code of this mapping is on the stack
-     */
-    c = input_common_readch(0);
-    if (c == input_function_get_code(m.command))
-    {
-        return input_exec_binding(m, m.seq);
-    }
-    input_unreadch(c);
-
+    //debug(0, L"trying mapping %ls\n", escape(m.seq.c_str(), 1));
     const wchar_t *str = m.seq.c_str();
     for (j=0; str[j] != L'\0'; j++)
     {
-        bool timed = (j > 0);
+        bool timed = (j > 0 && iswcntrl(str[0]));
+
         c = input_common_readch(timed);
         if (str[j] != c)
+        {
             break;
+        }
     }
 
     if (str[j] == L'\0')
     {
+        //debug(0, L"matched mapping %ls (%ls)\n", escape(m.seq.c_str(), 1), m.command.c_str());
         /* We matched the entire sequence */
-        return input_exec_binding(m, m.seq);
+        return true;
     }
     else
     {
@@ -481,7 +634,8 @@ static wint_t input_try_mapping(const input_mapping_t &m)
             input_unreadch(m.seq[k]);
         }
     }
-    return 0;
+
+    return false;
 
 }
 
@@ -490,84 +644,123 @@ void input_unreadch(wint_t ch)
     input_common_unreadch(ch);
 }
 
+static void input_mapping_execute_matching_or_generic()
+{
+    const input_mapping_t *generic = NULL;
+
+    const wcstring bind_mode = input_get_bind_mode();
+
+    for (int i = 0; i < mapping_list.size(); i++)
+    {
+        const input_mapping_t &m = mapping_list.at(i);
+
+        //debug(0, L"trying mapping (%ls,%ls,%ls)\n", escape(m.seq.c_str(), 1),
+        //           m.mode.c_str(), m.sets_mode.c_str());
+
+        if (m.mode != bind_mode)
+        {
+            //debug(0, L"skipping mapping because mode %ls != %ls\n", m.mode.c_str(), input_get_bind_mode());
+            continue;
+        }
+
+        if (m.seq.length() == 0)
+        {
+            generic = &m;
+        }
+        else if (input_mapping_is_match(m))
+        {
+            input_mapping_execute(m);
+            return;
+        }
+    }
+
+    if (generic)
+    {
+        input_mapping_execute(*generic);
+    }
+    else
+    {
+        //debug(0, L"no generic found, ignoring...");
+        wchar_t c = input_common_readch(0);
+        if (c == R_EOF)
+            input_common_unreadch(c);
+    }
+}
+
 wint_t input_readch()
 {
-
-    size_t i;
-
     CHECK_BLOCK(R_NULL);
 
     /*
        Clear the interrupted flag
-       */
+    */
     reader_reset_interrupted();
 
     /*
        Search for sequence in mapping tables
-       */
+    */
 
     while (1)
     {
-        const input_mapping_t *generic = 0;
-        for (i=0; i<mapping_list.size(); i++)
-        {
-            const input_mapping_t &m = mapping_list.at(i);
-            wint_t res = input_try_mapping(m);
-            if (res)
-                return res;
-
-            if (m.seq.length() == 0)
-            {
-                generic = &m;
-            }
-
-        }
-
-        /*
-             No matching exact mapping, try to find generic mapping.
-             */
-
-        if (generic)
-        {
-            wchar_t arr[2]=
-            {
-                0,
-                0
-            }
-            ;
-            arr[0] = input_common_readch(0);
-
-            return input_exec_binding(*generic, arr);
-        }
-
-        /*
-             No action to take on specified character, ignore it
-             and move to next one.
-             */
         wchar_t c = input_common_readch(0);
 
-        /* If it's closed, then just return */
-        if (c == R_EOF)
+        if (c >= R_MIN && c <= R_MAX)
         {
-            return WEOF;
+            switch (c)
+            {
+                case R_EOF: /* If it's closed, then just return */
+                {
+                    return WEOF;
+                }
+                case R_SELF_INSERT:
+                {
+                    return input_common_readch(0);
+                }
+                case R_AND:
+                {
+                    if (input_function_status)
+                    {
+                        return input_readch();
+                    }
+                    else
+                    {
+                        while ((c = input_common_readch(0)) && c >= R_MIN && c <= R_MAX);
+                        input_unreadch(c);
+                        return input_readch();
+                    }
+                }
+                default:
+                {
+                    return c;
+                }
+            }
+        }
+        else
+        {
+            input_unreadch(c);
+            input_mapping_execute_matching_or_generic();
         }
     }
 }
 
-void input_mapping_get_names(wcstring_list_t &lst)
+wcstring_list_t input_mapping_get_names()
 {
-    size_t i;
+    // Sort the mappings by the user specification order, so we can return them in the same order that the user specified them in
+    std::vector<input_mapping_t> local_list = mapping_list;
+    std::sort(local_list.begin(), local_list.end(), specification_order_is_less_than);
+    wcstring_list_t result;
+    result.reserve(local_list.size());
 
-    for (i=0; i<mapping_list.size(); i++)
+    for (size_t i=0; i<local_list.size(); i++)
     {
-        const input_mapping_t &m = mapping_list.at(i);
-        lst.push_back(wcstring(m.seq));
+        const input_mapping_t &m = local_list.at(i);
+        result.push_back(m.seq);
     }
-
+    return result;
 }
 
 
-bool input_mapping_erase(const wchar_t *sequence)
+bool input_mapping_erase(const wchar_t *sequence, const wchar_t *mode)
 {
     ASSERT_IS_MAIN_THREAD();
     bool result = false;
@@ -576,7 +769,7 @@ bool input_mapping_erase(const wchar_t *sequence)
     for (i=0; i<sz; i++)
     {
         const input_mapping_t &m = mapping_list.at(i);
-        if (sequence == m.seq)
+        if (sequence == m.seq && (mode == NULL || mode == m.mode))
         {
             if (i != (sz-1))
             {
@@ -591,20 +784,23 @@ bool input_mapping_erase(const wchar_t *sequence)
     return result;
 }
 
-bool input_mapping_get(const wcstring &sequence, wcstring &cmd)
+bool input_mapping_get(const wcstring &sequence, wcstring_list_t *out_cmds, wcstring *out_mode, wcstring *out_sets_mode)
 {
-    size_t i, sz = mapping_list.size();
-
-    for (i=0; i<sz; i++)
+    bool result = false;
+    size_t sz = mapping_list.size();
+    for (size_t i=0; i<sz; i++)
     {
         const input_mapping_t &m = mapping_list.at(i);
         if (sequence == m.seq)
         {
-            cmd = m.command;
-            return true;
+            *out_cmds = m.commands;
+            *out_mode = m.mode;
+            *out_sets_mode = m.sets_mode;
+            result = true;
+            break;
         }
     }
-    return false;
+    return result;
 }
 
 /**

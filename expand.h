@@ -19,6 +19,7 @@
 
 #include "util.h"
 #include "common.h"
+#include "parse_constants.h"
 #include <list>
 
 enum
@@ -146,9 +147,10 @@ class parser_t;
    \param input The parameter to expand
    \param output The list to which the result will be appended.
    \param flag Specifies if any expansion pass should be skipped. Legal values are any combination of EXPAND_SKIP_CMDSUBST EXPAND_SKIP_VARIABLES and EXPAND_SKIP_WILDCARDS
+   \param errors Resulting errors, or NULL to ignore
    \return One of EXPAND_OK, EXPAND_ERROR, EXPAND_WILDCARD_MATCH and EXPAND_WILDCARD_NO_MATCH. EXPAND_WILDCARD_NO_MATCH and EXPAND_WILDCARD_MATCH are normal exit conditions used only on strings containing wildcards to tell if the wildcard produced any matches.
 */
-__warn_unused int expand_string(const wcstring &input, std::vector<completion_t> &output, expand_flags_t flags);
+__warn_unused int expand_string(const wcstring &input, std::vector<completion_t> &output, expand_flags_t flags, parse_error_list_t *errors);
 
 
 /**
@@ -158,9 +160,10 @@ __warn_unused int expand_string(const wcstring &input, std::vector<completion_t>
 
    \param inout_str The parameter to expand in-place
    \param flag Specifies if any expansion pass should be skipped. Legal values are any combination of EXPAND_SKIP_CMDSUBST EXPAND_SKIP_VARIABLES and EXPAND_SKIP_WILDCARDS
+   \param errors Resulting errors, or NULL to ignore
    \return Whether expansion succeded
 */
-bool expand_one(wcstring &inout_str, expand_flags_t flags);
+bool expand_one(wcstring &inout_str, expand_flags_t flags, parse_error_list_t *errors = NULL);
 
 /**
    Convert the variable value to a human readable form, i.e. escape things, handle arrays, etc. Suitable for pretty-printing. The result must be free'd!
@@ -175,6 +178,9 @@ wcstring expand_escape_variable(const wcstring &in);
    \param input the string to tilde expand
 */
 void expand_tilde(wcstring &input);
+
+/** Perform the opposite of tilde expansion on the string, which is modified in place */
+wcstring replace_home_directory_with_tilde(const wcstring &str);
 
 /**
    Test if the specified argument is clean, i.e. it does not contain
@@ -199,7 +205,7 @@ int expand_is_clean(const wchar_t *in);
    \param token_pos The position where the expansion begins
    \param error_pos The position on the line to report to the error function.
 */
-void expand_variable_error(parser_t &parser, const wchar_t *token, size_t token_pos, int error_pos);
+void expand_variable_error(parser_t &parser, const wcstring &token, size_t token_pos, int error_pos);
 
 /**
    Testing function for getting all process names.

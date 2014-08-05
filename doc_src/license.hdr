@@ -1,5 +1,7 @@
 /** \page license Licenses
 
+\htmlonly <div class="fish_only_bar"> \endhtmlonly
+
 <h2>License for fish</h2>
 
 Fish Copyright (C) 2005-2009 Axel Liljencrantz. Fish is released under
@@ -15,7 +17,7 @@ Version 2, June 1991
 
 <PRE>
 Copyright (C) 1989, 1991 Free Software Foundation, Inc.
-59 Temple Place - Suite 330, Boston, MA  02111-1307, USA
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 Everyone is permitted to copy and distribute verbatim copies
 of this license document, but changing it is not allowed.
@@ -993,7 +995,7 @@ Version 2, June 1991
 
 <PRE>
 Copyright (C) 1989, 1991 Free Software Foundation, Inc.
-59 Temple Place - Suite 330, Boston, MA  02111-1307, USA
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 Everyone is permitted to copy and distribute verbatim copies
 of this license document, but changing it is not allowed.
@@ -1399,3 +1401,21 @@ POSSIBILITY OF SUCH DAMAGES.
 <P>
 
 */
+
+<h2>License for UTF8</h2>
+
+<p>Copyright (c) 2007 Alexey Vatchenko <av@bsdua.org>
+
+<p>Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+<p>THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+\htmlonly </div> \endhtmlonly

@@ -45,6 +45,7 @@ efficient way for transforming that to the desired screen content.
 #include "highlight.h"
 #include "screen.h"
 #include "env.h"
+#include "pager.h"
 
 /** The number of characters to indent new blocks */
 #define INDENT_STEP 4
@@ -92,11 +93,9 @@ public:
    specified position of the specified wide character string. All of
    \c seq must match, but str may be longer than seq.
 */
-static int try_sequence(const char *seq, const wchar_t *str)
+static size_t try_sequence(const char *seq, const wchar_t *str)
 {
-    int i;
-
-    for (i=0;; i++)
+    for (size_t i=0; ; i++)
     {
         if (!seq[i])
             return i;
@@ -121,29 +120,6 @@ static size_t next_tab_stop(size_t in)
     return ((in/tab_width)+1)*tab_width;
 }
 
-// PCA for term256 support, let's just detect the escape codes directly
-static int is_term256_escape(const wchar_t *str)
-{
-    // An escape code looks like this: \x1b[38;5;<num>m
-    // or like this: \x1b[48;5;<num>m
-
-    // parse out the required prefix
-    int len = try_sequence("\x1b[38;5;", str);
-    if (! len) len = try_sequence("\x1b[48;5;", str);
-    if (! len) return 0;
-
-    // now try parsing out a string of digits
-    // we need at least one
-    if (! iswdigit(str[len])) return 0;
-    while (iswdigit(str[len])) len++;
-
-    // look for the terminating m
-    if (str[len++] != L'm') return 0;
-
-    // success
-    return len;
-}
-
 /* Like fish_wcwidth, but returns 0 for control characters instead of -1 */
 static int fish_wcwidth_min_0(wchar_t wc)
 {
@@ -155,6 +131,178 @@ static bool allow_soft_wrap(void)
 {
     // Should we be looking at eat_newline_glitch as well?
     return !! auto_right_margin;
+}
+
+
+/* Returns the number of characters in the escape code starting at 'code' (which should initially contain \x1b) */
+size_t escape_code_length(const wchar_t *code)
+{
+    assert(code != NULL);
+
+    /* The only escape codes we recognize start with \x1b */
+    if (code[0] != L'\x1b')
+        return 0;
+
+    size_t resulting_length = 0;
+    bool found = false;
+
+    if (cur_term != NULL)
+    {
+        /*
+         Detect these terminfo color escapes with parameter
+         value 0..7, all of which don't move the cursor
+         */
+        char * const esc[] =
+        {
+            set_a_foreground,
+            set_a_background,
+            set_foreground,
+            set_background,
+        };
+
+        for (size_t p=0; p < sizeof esc / sizeof *esc && !found; p++)
+        {
+            if (!esc[p])
+                continue;
+
+            for (size_t k=0; k<8; k++)
+            {
+                size_t len = try_sequence(tparm(esc[p],k), code);
+                if (len)
+                {
+                    resulting_length = len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (cur_term != NULL)
+    {
+        /*
+         Detect these semi-common terminfo escapes without any
+         parameter values, all of which don't move the cursor
+         */
+        char * const esc2[] =
+        {
+            enter_bold_mode,
+            exit_attribute_mode,
+            enter_underline_mode,
+            exit_underline_mode,
+            enter_standout_mode,
+            exit_standout_mode,
+            flash_screen,
+            enter_subscript_mode,
+            exit_subscript_mode,
+            enter_superscript_mode,
+            exit_superscript_mode,
+            enter_blink_mode,
+            enter_italics_mode,
+            exit_italics_mode,
+            enter_reverse_mode,
+            enter_shadow_mode,
+            exit_shadow_mode,
+            enter_standout_mode,
+            exit_standout_mode,
+            enter_secure_mode
+        };
+
+
+
+        for (size_t p=0; p < sizeof esc2 / sizeof *esc2 && !found; p++)
+        {
+            if (!esc2[p])
+                continue;
+            /*
+             Test both padded and unpadded version, just to
+             be safe. Most versions of tparm don't actually
+             seem to do anything these days.
+             */
+            size_t len = maxi(try_sequence(tparm(esc2[p]), code), try_sequence(esc2[p], code));
+            if (len)
+            {
+                resulting_length = len;
+                found = true;
+            }
+        }
+    }
+
+    if (!found)
+    {
+        if (code[1] == L'k')
+        {
+            /* This looks like the escape sequence for setting a screen name */
+            const env_var_t term_name = env_get_string(L"TERM");
+            if (!term_name.missing() && string_prefixes_string(L"screen", term_name))
+            {
+                const wchar_t * const screen_name_end_sentinel = L"\x1b\\";
+                const wchar_t *screen_name_end = wcsstr(&code[2], screen_name_end_sentinel);
+                if (screen_name_end != NULL)
+                {
+                    const wchar_t *escape_sequence_end = screen_name_end + wcslen(screen_name_end_sentinel);
+                    resulting_length = escape_sequence_end - code;
+                }
+                else
+                {
+                    /* Consider just <esc>k to be the code */
+                    resulting_length = 2;
+                }
+                found = true;
+            }
+        }
+    }
+
+    if (! found)
+    {
+        /* Generic VT100 one byte sequence: CSI followed by something in the range @ through _ */
+        if (code[1] == L'[' && (code[2] >= L'@' && code[2] <= L'_'))
+        {
+            resulting_length = 3;
+            found = true;
+        }
+    }
+
+    if (! found)
+    {
+        /* Generic VT100 CSI-style sequence. <esc>, followed by zero or more ASCII characters NOT in the range [@,_], followed by one character in that range */
+        if (code[1] == L'[')
+        {
+            // Start at 2 to skip over <esc>[
+            size_t cursor = 2;
+            for (; code[cursor] != L'\0'; cursor++)
+            {
+                /* Consume a sequence of ASCII characters not in the range [@, ~] */
+                wchar_t c = code[cursor];
+
+                /* If we're not in ASCII, just stop */
+                if (c > 127)
+                    break;
+
+                /* If we're the end character, then consume it and then stop */
+                if (c >= L'@' && c <= L'~')
+                {
+                    cursor++;
+                    break;
+                }
+            }
+            /* curs now indexes just beyond the end of the sequence (or at the terminating zero) */
+            found = true;
+            resulting_length = cursor;
+        }
+    }
+
+    if (! found)
+    {
+        /* Generic VT100 two byte sequence: <esc> followed by something in the range @ through _ */
+        if (code[1] >= L'@' && code[1] <= L'_')
+        {
+            resulting_length = 2;
+            found = true;
+        }
+    }
+
+    return resulting_length;
 }
 
 /* Information about a prompt layout */
@@ -178,7 +326,7 @@ struct prompt_layout_t
 static prompt_layout_t calc_prompt_layout(const wchar_t *prompt)
 {
     size_t current_line_width = 0;
-    size_t j, k;
+    size_t j;
 
     prompt_layout_t prompt_layout = {};
     prompt_layout.line_count = 1;
@@ -187,134 +335,12 @@ static prompt_layout_t calc_prompt_layout(const wchar_t *prompt)
     {
         if (prompt[j] == L'\x1b')
         {
-            /*
-             This is the start of an escape code. Try to guess its width.
-             */
-            size_t p;
-            int len=0;
-            bool found = false;
-
-            /*
-             Detect these terminfo color escapes with parameter
-             value 0..7, all of which don't move the cursor
-             */
-            char * const esc[] =
+            /* This is the start of an escape code. Skip over it if it's at least one character long. */
+            size_t escape_len = escape_code_length(&prompt[j]);
+            if (escape_len > 0)
             {
-                set_a_foreground,
-                set_a_background,
-                set_foreground,
-                set_background,
+                j += escape_len - 1;
             }
-            ;
-
-            /*
-             Detect these semi-common terminfo escapes without any
-             parameter values, all of which don't move the cursor
-             */
-            char * const esc2[] =
-            {
-                enter_bold_mode,
-                exit_attribute_mode,
-                enter_underline_mode,
-                exit_underline_mode,
-                enter_standout_mode,
-                exit_standout_mode,
-                flash_screen,
-                enter_subscript_mode,
-                exit_subscript_mode,
-                enter_superscript_mode,
-                exit_superscript_mode,
-                enter_blink_mode,
-                enter_italics_mode,
-                exit_italics_mode,
-                enter_reverse_mode,
-                enter_shadow_mode,
-                exit_shadow_mode,
-                enter_standout_mode,
-                exit_standout_mode,
-                enter_secure_mode
-            }
-            ;
-
-            for (p=0; p < sizeof esc / sizeof *esc && !found; p++)
-            {
-                if (!esc[p])
-                    continue;
-
-                for (k=0; k<8; k++)
-                {
-                    len = try_sequence(tparm(esc[p],k), &prompt[j]);
-                    if (len)
-                    {
-                        j += (len-1);
-                        found = true;
-                        break;
-                    }
-                }
-            }
-
-            /* PCA for term256 support, let's just detect the escape codes directly */
-            if (! found)
-            {
-                len = is_term256_escape(&prompt[j]);
-                if (len)
-                {
-                    j += (len - 1);
-                    found = true;
-                }
-            }
-
-
-            for (p=0; p < (sizeof(esc2)/sizeof(char *)) && !found; p++)
-            {
-                if (!esc2[p])
-                    continue;
-                /*
-                 Test both padded and unpadded version, just to
-                 be safe. Most versions of tparm don't actually
-                 seem to do anything these days.
-                 */
-                len = maxi(try_sequence(tparm(esc2[p]), &prompt[j]),
-                           try_sequence(esc2[p], &prompt[j]));
-
-                if (len)
-                {
-                    j += (len-1);
-                    found = true;
-                }
-            }
-
-            if (!found)
-            {
-                if (prompt[j+1] == L'k')
-                {
-                    const env_var_t term_name = env_get_string(L"TERM");
-                    if (!term_name.missing() && string_prefixes_string(L"screen", term_name))
-                    {
-                        const wchar_t *end;
-                        j+=2;
-                        found = true;
-                        end = wcsstr(&prompt[j], L"\x1b\\");
-                        if (end)
-                        {
-                            /*
-                             You'd thing this should be
-                             '(end-prompt)+2', in order to move j
-                             past the end of the string, but there is
-                             a 'j++' at the end of each lap, so j
-                             should always point to the last menged
-                             character, e.g. +1.
-                             */
-                            j = (end-prompt)+1;
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-
         }
         else if (prompt[j] == L'\t')
         {
@@ -512,10 +538,6 @@ static void s_desired_append_char(screen_t *s,
                 s->desired.add_line();
                 s->desired.cursor.y++;
                 s->desired.cursor.x=0;
-                for (size_t i=0; i < prompt_width; i++)
-                {
-                    s_desired_append_char(s, L' ', 0, indent, prompt_width);
-                }
             }
 
             line_t &line = s->desired.line(line_no);
@@ -647,7 +669,7 @@ static void s_move(screen_t *s, data_buffer_t *b, int new_x, int new_y)
 /**
    Set the pen color for the terminal
 */
-static void s_set_color(screen_t *s, data_buffer_t *b, int c)
+static void s_set_color(screen_t *s, data_buffer_t *b, highlight_spec_t c)
 {
     scoped_buffer_t scoped_buffer(b);
 
@@ -1006,7 +1028,7 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
 
     if (! output.empty())
     {
-        write_loop(1, &output.at(0), output.size());
+        write_loop(STDOUT_FILENO, &output.at(0), output.size());
     }
 
     /* We have now synced our actual screen against our desired screen. Note that this is a big assignment! */
@@ -1073,7 +1095,7 @@ static screen_layout_t compute_layout(screen_t *s,
     size_t left_prompt_width = left_prompt_layout.last_line_width;
     size_t right_prompt_width = right_prompt_layout.last_line_width;
 
-    if (left_prompt_layout.max_line_width >= screen_width)
+    if (left_prompt_layout.max_line_width > screen_width)
     {
         /* If we have a multi-line prompt, see if the longest line fits; if not neuter the whole left prompt */
         left_prompt = L"> ";
@@ -1190,7 +1212,15 @@ static screen_layout_t compute_layout(screen_t *s,
         result.left_prompt_space = left_prompt_width;
         // See remark about for why we can't use the right prompt here
         //result.right_prompt = right_prompt;
-        result.prompts_get_own_line = true;
+
+        // If the command wraps, and the prompt is not short, place the command on its own line.
+        // A short prompt is 33% or less of the terminal's width.
+        const size_t prompt_percent_width = (100 * left_prompt_width) / screen_width;
+        if (left_prompt_width + first_command_line_width + 1 > screen_width && prompt_percent_width > 33)
+        {
+            result.prompts_get_own_line = true;
+        }
+
         done = true;
     }
 
@@ -1204,9 +1234,13 @@ void s_write(screen_t *s,
              const wcstring &right_prompt,
              const wcstring &commandline,
              size_t explicit_len,
-             const int *colors,
+             const highlight_spec_t *colors,
              const int *indent,
-             size_t cursor_pos)
+             size_t cursor_pos,
+             size_t sel_start_pos,
+             size_t sel_stop_pos,
+             const page_rendering_t &pager,
+             bool cursor_position_is_within_pager)
 {
     screen_data_t::cursor_t cursor_arr;
 
@@ -1245,6 +1279,9 @@ void s_write(screen_t *s,
     /* Compute a layout */
     const screen_layout_t layout = compute_layout(s, screen_width, left_prompt, right_prompt, explicit_command_line, autosuggestion, indent);
 
+    /* Determine whether, if we have an autosuggestion, it was truncated */
+    s->autosuggestion_is_truncated = ! autosuggestion.empty() && autosuggestion != layout.autosuggestion;
+
     /* Clear the desired screen */
     s->desired.resize(0);
     s->desired.cursor.x = s->desired.cursor.y = 0;
@@ -1272,24 +1309,30 @@ void s_write(screen_t *s,
     {
         int color = colors[i];
 
-        if (i == cursor_pos)
+        if (! cursor_position_is_within_pager && i == cursor_pos)
         {
             color = 0;
-        }
-
-        if (i == cursor_pos)
-        {
             cursor_arr = s->desired.cursor;
         }
 
         s_desired_append_char(s, effective_commandline.at(i), color, indent[i], first_line_prompt_space);
     }
-    if (i == cursor_pos)
+    if (! cursor_position_is_within_pager && i == cursor_pos)
     {
         cursor_arr = s->desired.cursor;
     }
 
     s->desired.cursor = cursor_arr;
+
+    if (cursor_position_is_within_pager)
+    {
+        s->desired.cursor.x = (int)cursor_pos;
+        s->desired.cursor.y = (int)s->desired.line_count();
+    }
+
+    /* Append pager_data (none if empty) */
+    s->desired.append_lines(pager.screen_data);
+
     s_update(s, layout.left_prompt.c_str(), layout.right_prompt.c_str());
     s_save_status(s);
 }
@@ -1395,6 +1438,22 @@ void s_reset(screen_t *s, screen_reset_mode_t mode)
     fstat(2, &s->prev_buff_2);
 }
 
+bool screen_force_clear_to_end()
+{
+    bool result = false;
+    if (clr_eos)
+    {
+        data_buffer_t output;
+        s_write_mbs(&output, clr_eos);
+        if (! output.empty())
+        {
+            write_loop(STDOUT_FILENO, &output.at(0), output.size());
+            result = true;
+        }
+    }
+    return result;
+}
+
 screen_t::screen_t() :
     desired(),
     actual(),
@@ -1402,6 +1461,7 @@ screen_t::screen_t() :
     last_right_prompt_width(),
     actual_width(SCREEN_WIDTH_UNINITIALIZED),
     soft_wrap_location(INVALID_LOCATION),
+    autosuggestion_is_truncated(false),
     need_clear_lines(false),
     need_clear_screen(false),
     actual_lines_before_reset(0),

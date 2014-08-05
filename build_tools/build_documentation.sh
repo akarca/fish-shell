@@ -20,10 +20,8 @@ else
 fi
 
 # Determine which man pages we don't want to generate.
-# Don't make a test man page. fish's test is conforming, so the system man pages
-# are applicable and generally better.
 # on OS X, don't make a man page for open, since we defeat fish's open function on OS X.
-CONDEMNED_PAGES=test.1
+CONDEMNED_PAGES=
 if test `uname` = 'Darwin'; then
 	CONDEMNED_PAGES="$CONDEMNED_PAGES open.1"
 fi
@@ -88,7 +86,7 @@ done
 # Input is kept as . because we cd to the input directory beforehand
 # This prevents doxygen from generating "documentation" for intermediate directories
 DOXYPARAMS=$(cat <<EOF
-PROJECT_NUMBER=2.0.0
+PROJECT_NUMBER=$PROJECT_NUMBER
 INPUT=.
 OUTPUT_DIRECTORY=$OUTPUTDIR
 QUIET=YES

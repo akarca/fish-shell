@@ -18,6 +18,12 @@ Test  pass
 Test 3 pass
 Test 4 pass
 Test 5 pass
+Test redirections
+errput
+output
+errput
+output
+is_stdout
 abc\ndef
 abc
 def
@@ -30,3 +36,4 @@ abc
 Catch your breath
 abc!def
 abc!1def
+1

@@ -12,7 +12,7 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 
 
@@ -106,8 +106,8 @@ static int indent(wcstring &out, const wcstring &in, int flags)
                     int next_indent = indent;
                     is_command = 0;
 
-                    wcstring unesc = last;
-                    unescape_string(unesc, UNESCAPE_SPECIAL);
+                    wcstring unesc;
+                    unescape_string(last, &unesc, UNESCAPE_SPECIAL);
 
                     if (parser_keywords_is_block(unesc))
                     {
@@ -344,7 +344,7 @@ int main(int argc, char **argv)
                 fwprintf(stderr,
                          _(L"%ls, version %s\n"),
                          program_name,
-                         PACKAGE_VERSION);
+                         FISH_BUILD_VERSION);
                 exit(0);
             }
 

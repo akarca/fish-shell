@@ -39,7 +39,7 @@ struct function_data_t
     /**
        Function definition
      */
-    wchar_t *definition;
+    const wchar_t *definition;
     /**
        List of all event handlers for this function
      */
@@ -92,8 +92,11 @@ public:
 */
 void function_init();
 
-/** Add a function. */
-void function_add(const function_data_t &data, const parser_t &parser);
+/** Add a function. definition_line_offset is the line number of the function's definition within its source file */
+void function_add(const function_data_t &data, const parser_t &parser, int definition_line_offset = 0);
+
+/** Removes a function from our internal table, returning true if it was found and false if not */
+bool function_remove_ignore_autoload(const wcstring &name);
 
 /**
    Remove the function with the specified name.

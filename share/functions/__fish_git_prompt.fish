@@ -2,7 +2,7 @@
 #
 # Written by Kevin Ballard <kevin@sb.org>
 # Updated by Brian Gernhardt <brian@gernhardtsoftware.com>
-#
+#							
 # This is heavily based off of the git-prompt.bash script that ships with
 # git, which is Copyright (C) 2006,2007 Shawn O. Pearce <spearce@spearce.org>.
 # The act of porting the code, along with any new code, are Copyright (C) 2012
@@ -51,6 +51,7 @@
 # __fish_git_prompt_showupstream to a space-separated list of values:
 #
 #     verbose        show number of commits ahead/behind (+/-) upstream
+#     name           if verbose, then also show the upstream abbrev name
 #     informative    similar to verbose, but shows nothing when equal (fish only)
 #     legacy         don't use the '--count' option available in recent versions
 #                    of git-rev-list
@@ -155,8 +156,8 @@
 #
 # The separator before the upstream information can be customized via
 # __fish_git_prompt_char_upstream_prefix.  It is colored like the rest of
-# the upstream information.  It normallly defaults to a space ( ) and defaults
-# to nothing () when __fish_git_prompt_show_informative_status is set.
+# the upstream information.  It normally defaults to nothing () and defaults
+# to a space ( ) when __fish_git_prompt_showupstream contains verbose.
 #
 #
 # Turning on __fish_git_prompt_showcolorhints changes the colors as follows to
@@ -179,6 +180,7 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 	set -l upstream git
 	set -l legacy
 	set -l verbose
+	set -l name
 
 	# Default to informative if show_informative_status is set
 	if test -n "$__fish_git_prompt_show_informative_status"
@@ -187,7 +189,7 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 
 	set -l svn_remote
 	# get some config options from git-config
-	git config -z --get-regexp '^(svn-remote\..*\.url|bash\.showupstream)$' ^/dev/null | tr '\0\n' '\n ' | while read -l key value
+	command git config -z --get-regexp '^(svn-remote\..*\.url|bash\.showupstream)$' ^/dev/null | tr '\0\n' '\n ' | while read -l key value
 		switch $key
 		case bash.showupstream
 			set show_upstream $value
@@ -203,7 +205,7 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 			set upstream svn+git # default upstream is SVN if available, else git
 
 			# Save the config key (without .url) for later use
-			set -l remote_prefix (/bin/sh -c 'echo "${1%.url}"' -- $key)
+			set -l remote_prefix (echo $key | sed 's/\.url$//')
 			set svn_prefix $svn_prefix $remote_prefix
 		end
 	end
@@ -223,6 +225,8 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 		case legacy
 			set legacy 1
 			set -e informative
+		case name
+			set name 1
 		case none
 			return
 		end
@@ -238,11 +242,11 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 		set -l svn_upstream (git log --first-parent -1 --grep="^git-svn-id: \($svn_url_pattern\)" ^/dev/null)
 		if test (count $svn_upstream) -ne 0
 			echo $svn_upstream[-1] | read -l _ svn_upstream _
-			set svn_upstream (/bin/sh -c 'echo "${1%@*}"' -- $svn_upstream)
+			set svn_upstream (echo $svn_upstream | sed 's/@.*//')
 			set -l cur_prefix
 			for i in (seq (count $svn_remote))
 				set -l remote $svn_remote[$i]
-				set -l mod_upstream (/bin/sh -c 'echo "${1#$2}"' -- $svn_upstream $remote)
+				set -l mod_upstream (echo $svn_upstream | sed "s|$remote||")
 				if test "$svn_upstream" != "$mod_upstream"
 					# we found a valid remote
 					set svn_upstream $mod_upstream
@@ -259,14 +263,14 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 					set upstream git-svn
 				end
 			else
-				set upstream (/bin/sh -c 'val=${1#/branches}; echo "${val#/}"' -- $svn_upstream)
+				set upstream (echo $svn_upstream | sed 's|/branches||; s|/||g')
 
 				# Use fetch config to fix upstream
-				set -l fetch_val (git config "$cur_prefix".fetch)
+				set -l fetch_val (command git config "$cur_prefix".fetch)
 				if test -n "$fetch_val"
 					set -l IFS :
 					echo "$fetch_val" | read -l trunk pattern
-					set upstream (/bin/sh -c 'echo "${1%/$2}"' -- $pattern $trunk)/$upstream
+					set upstream (echo $pattern | sed -e "s|/$trunk\$||") /$upstream
 				end
 			end
 		else if test $upstream = svn+git
@@ -276,11 +280,11 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 
 	# Find how many commits we are ahead/behind our upstream
 	if test -z "$legacy"
-		set count (git rev-list --count --left-right $upstream...HEAD ^/dev/null)
+		set count (command git rev-list --count --left-right $upstream...HEAD ^/dev/null)
 	else
 		# produce equivalent output to --count for older versions of git
 		set -l os
-		set -l commits (git rev-list --left-right $upstream...HEAD ^/dev/null; set os $status)
+		set -l commits (command git rev-list --left-right $upstream...HEAD ^/dev/null; set os $status)
 		if test $os -eq 0
 			set -l behind (count (for arg in $commits; echo $arg; end | grep '^<'))
 			set -l ahead (count (for arg in $commits; echo $arg; end | grep -v '^<'))
@@ -292,17 +296,27 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 
 	# calculate the result
 	if test -n "$verbose"
+		# Verbose has a space by default
+		set -l prefix "$___fish_git_prompt_char_upstream_prefix"
+		# Using two underscore version to check if user explicitly set to nothing
+		if not set -q __fish_git_prompt_char_upstream_prefix
+			set -l prefix " "
+		end
+
 		echo $count | read -l behind ahead
 		switch "$count"
 		case '' # no upstream
 		case "0	0" # equal to upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_equal"
+			echo "$prefix$___fish_git_prompt_char_upstream_equal"
 		case "0	*" # ahead of upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_ahead$ahead"
+			echo "$prefix$___fish_git_prompt_char_upstream_ahead$ahead"
 		case "*	0" # behind upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_behind$behind"
+			echo "$prefix$___fish_git_prompt_char_upstream_behind$behind"
 		case '*' # diverged from upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_diverged$ahead-$behind"
+			echo "$prefix$___fish_git_prompt_char_upstream_diverged$ahead-$behind"
+		end
+		if test -n "$count" -a -n "$name"
+			echo " "(command git rev-parse --abbrev-ref "$upstream" ^/dev/null)
 		end
 	else if test -n "$informative"
 		echo $count | read -l behind ahead
@@ -322,17 +336,17 @@ function __fish_git_prompt_show_upstream --description "Helper function for __fi
 		case "0	0" # equal to upstream
 			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_equal"
 		case "0	*" # ahead of upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_ahead$ahead"
+                        echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_ahead"
 		case "*	0" # behind upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_behind$behind"
+                        echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_behind"
 		case '*' # diverged from upstream
-			echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_diverged$ahead-$behind"
+                        echo "$___fish_git_prompt_char_upstream_prefix$___fish_git_prompt_char_upstream_diverged"
 		end
 	end
 end
 
 function __fish_git_prompt --description "Prompt function for Git"
-	set -l repo_info (git rev-parse --git-dir --is-inside-git-dir --is-bare-repository --is-inside-work-tree --short HEAD ^/dev/null)
+	set -l repo_info (command git rev-parse --git-dir --is-inside-git-dir --is-bare-repository --is-inside-work-tree --short HEAD ^/dev/null)
 	test -n "$repo_info"; or return
 
 	set -l git_dir         $repo_info[1]
@@ -357,13 +371,14 @@ function __fish_git_prompt --description "Prompt function for Git"
 	set -l informative_status
 
 	__fish_git_prompt_validate_chars
+	__fish_git_prompt_validate_colors
 
 	if test "true" = $inside_worktree
 		if test -n "$__fish_git_prompt_show_informative_status"
 			set informative_status "$___fish_git_prompt_char_stateseparator"(__fish_git_prompt_informative_status)
 		else
 			if test -n "$__fish_git_prompt_showdirtystate"
-				set -l config (git config --bool bash.showDirtyState)
+				set -l config (command git config --bool bash.showDirtyState)
 				if test "$config" != "false"
 					set w (__fish_git_prompt_dirty)
 					set i (__fish_git_prompt_staged $short_sha)
@@ -375,8 +390,9 @@ function __fish_git_prompt --description "Prompt function for Git"
 			end
 
 			if test -n "$__fish_git_prompt_showuntrackedfiles"
-				if test (git config --bool bash.showUntrackedFiles) != false
-					if git ls-files --others --exclude-standard --error-unmatch -- '*' >/dev/null ^/dev/null
+				set -l config (command git config --bool bash.showUntrackedFiles)
+				if test "$config" != false
+					if command git ls-files --others --exclude-standard --error-unmatch -- '*' >/dev/null ^/dev/null
 						set u $___fish_git_prompt_char_untrackedfiles
 					end
 				end
@@ -387,8 +403,6 @@ function __fish_git_prompt --description "Prompt function for Git"
 			set p (__fish_git_prompt_show_upstream)
 		end
 	end
-
-	__fish_git_prompt_validate_colors
 
 	set -l branch_color $___fish_git_prompt_color_branch
 	set -l branch_done  $___fish_git_prompt_color_branch_done
@@ -411,7 +425,7 @@ function __fish_git_prompt --description "Prompt function for Git"
 	if test -n "$u"
 		set u "$___fish_git_prompt_color_untrackedfiles$u$___fish_git_prompt_color_untrackedfiles_done"
 	end
-	set b (/bin/sh -c 'echo "${1#refs/heads/}"' -- $b)
+	set b (echo $b | sed 's|refs/heads/||')
 	if test -n "$b"
 		set b "$branch_color$b$branch_done"
 	end
@@ -447,7 +461,7 @@ function __fish_git_prompt_staged --description "__fish_git_prompt helper, tells
 	set -l staged
 
 	if test -n "$short_sha"
-		git diff-index --cached --quiet HEAD --; or set staged $___fish_git_prompt_char_stagedstate
+		command git diff-index --cached --quiet HEAD --; or set staged $___fish_git_prompt_char_stagedstate
 	else
 		set staged $___fish_git_prompt_char_invalidstate
 	end
@@ -458,7 +472,7 @@ function __fish_git_prompt_dirty --description "__fish_git_prompt helper, tells 
 	set -l dirty
 
 	set -l os
-	git diff --no-ext-diff --quiet --exit-code
+	command git diff --no-ext-diff --quiet --exit-code
 	set os $status
 	if test $os -ne 0
 		set dirty $___fish_git_prompt_char_dirtystate
@@ -470,13 +484,13 @@ set -g ___fish_git_prompt_status_order stagedstate invalidstate dirtystate untra
 
 function  __fish_git_prompt_informative_status
 
-	set -l changedFiles (git diff --name-status | cut -c 1-2)
-	set -l stagedFiles (git diff --staged --name-status | cut -c 1-2)
+	set -l changedFiles (command git diff --name-status | cut -c 1-2)
+	set -l stagedFiles (command git diff --staged --name-status | cut -c 1-2)
 
 	set -l dirtystate (math (count $changedFiles) - (count (echo $changedFiles | grep "U")))
 	set -l invalidstate (count (echo $stagedFiles | grep "U"))
 	set -l stagedstate (math (count $stagedFiles) - $invalidstate)
-	set -l untrackedfiles (count (git ls-files --others --exclude-standard))
+	set -l untrackedfiles (count (command git ls-files --others --exclude-standard))
 
 	set -l info
 
@@ -564,18 +578,18 @@ function __fish_git_prompt_operation_branch_bare --description "__fish_git_promp
 	end
 
 	if test -z "$branch"
-		set branch (git symbolic-ref HEAD ^/dev/null; set os $status)
+		set branch (command git symbolic-ref HEAD ^/dev/null; set os $status)
 		if test $os -ne 0
 			set detached yes
 			set branch (switch "$__fish_git_prompt_describe_style"
 						case contains
-							git describe --contains HEAD
+							command git describe --contains HEAD
 						case branch
-							git describe --contains --all HEAD
+							command git describe --contains --all HEAD
 						case describe
-							git describe HEAD
+							command git describe HEAD
 						case default '*'
-							git describe --tags --exact-match HEAD
+							command git describe --tags --exact-match HEAD
 						end ^/dev/null; set os $status)
 			if test $os -ne 0
 				if test -n "$short_sha"
@@ -635,7 +649,7 @@ function __fish_git_prompt_validate_chars --description "__fish_git_prompt helpe
 	__fish_git_prompt_set_char __fish_git_prompt_char_upstream_behind   '<' '↓'
 	__fish_git_prompt_set_char __fish_git_prompt_char_upstream_diverged '<>'
 	__fish_git_prompt_set_char __fish_git_prompt_char_upstream_equal    '='
-	__fish_git_prompt_set_char __fish_git_prompt_char_upstream_prefix   ' '
+	__fish_git_prompt_set_char __fish_git_prompt_char_upstream_prefix   ''
 
 end
 
@@ -657,21 +671,12 @@ function __fish_git_prompt_set_color
 		set default_done "$argv[3]"
 	end
 
-	if test (count $user_variable) -eq 2
-		set user_variable_bright $user_variable[2]
-		set user_variable $user_variable[1]
-	end
-
 	set -l variable _$user_variable_name
 	set -l variable_done "$variable"_done
 
 	if not set -q $variable
 		if test -n "$user_variable"
-			if test -n "$user_variable_bright"
-				set -g $variable (set_color --bold $user_variable)
-			else
-				set -g $variable (set_color $user_variable)
-			end
+			set -g $variable (set_color $user_variable)
 			set -g $variable_done (set_color normal)
 		else
 			set -g $variable $default

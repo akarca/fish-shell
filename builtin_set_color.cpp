@@ -81,6 +81,12 @@ static int builtin_set_color(parser_t &parser, wchar_t **argv)
 
     int argc = builtin_count_args(argv);
 
+    /* Some code passes variables to set_color that don't exist, like $fish_user_whatever. As a hack, quietly return failure. */
+    if (argc <= 1)
+    {
+        return EXIT_FAILURE;
+    }
+
     const wchar_t *bgcolor = NULL;
     bool bold = false, underline=false;
     int errret;
@@ -152,14 +158,14 @@ static int builtin_set_color(parser_t &parser, wchar_t **argv)
     }
 
     const rgb_color_t fg = rgb_color_t(fgcolor ? fgcolor : L"");
-    if (fgcolor && fg.is_none())
+    if (fgcolor && (fg.is_none() || fg.is_ignore()))
     {
         append_format(stderr_buffer, _(L"%ls: Unknown color '%ls'\n"), argv[0], fgcolor);
         return STATUS_BUILTIN_ERROR;
     }
 
     const rgb_color_t bg = rgb_color_t(bgcolor ? bgcolor : L"");
-    if (bgcolor && bg.is_none())
+    if (bgcolor && (bg.is_none() || bg.is_ignore()))
     {
         append_format(stderr_buffer, _(L"%ls: Unknown color '%ls'\n"), argv[0], bgcolor);
         return STATUS_BUILTIN_ERROR;
@@ -212,7 +218,7 @@ static int builtin_set_color(parser_t &parser, wchar_t **argv)
 
     if (fgcolor != NULL)
     {
-        if (fg.is_normal())
+        if (fg.is_normal() || fg.is_reset())
         {
             write_foreground_color(0);
             writembs(tparm(exit_attribute_mode));
@@ -225,7 +231,7 @@ static int builtin_set_color(parser_t &parser, wchar_t **argv)
 
     if (bgcolor != NULL)
     {
-        if (! bg.is_normal())
+        if (! bg.is_normal() && ! bg.is_reset())
         {
             write_background_color(index_for_color(bg));
         }
@@ -235,9 +241,8 @@ static int builtin_set_color(parser_t &parser, wchar_t **argv)
     output_set_writer(saved_writer_func);
 
     /* Output the collected string */
-    std::string local_output;
-    std::swap(builtin_set_color_output, local_output);
-    stdout_buffer.append(str2wcstring(local_output));
+    stdout_buffer.append(str2wcstring(builtin_set_color_output));
+    builtin_set_color_output.clear();
 
     return STATUS_BUILTIN_OK;
 }

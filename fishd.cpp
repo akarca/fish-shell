@@ -529,6 +529,14 @@ static bool acquire_socket_lock(const std::string &sock_name, std::string *out_l
 */
 static int get_socket(void)
 {
+    // Cygwin has random problems involving sockets. When using Cygwin,
+    // allow 20 attempts at making socket correctly.
+#ifdef __CYGWIN__
+    int attempts = 0;
+repeat:
+    attempts += 1;
+#endif
+
     int s, len, doexit = 0;
     int exitcode = EXIT_FAILURE;
     struct sockaddr_un local;
@@ -599,6 +607,10 @@ unlock:
 
     if (doexit)
     {
+        // If Cygwin, only allow normal quit when made lots of attempts.
+#ifdef __CYGWIN__
+        if (exitcode && attempts < 20) goto repeat;
+#endif
         exit_without_destructors(exitcode);
     }
 
@@ -655,13 +667,14 @@ static void daemonize()
             setup_fork_guards();
 
             /*
-              Make fishd ignore the HUP signal.
+              Make fishd ignore the HUP and PIPE signals.
             */
             struct sigaction act;
             sigemptyset(& act.sa_mask);
             act.sa_flags=0;
             act.sa_handler=SIG_IGN;
             sigaction(SIGHUP, &act, 0);
+            sigaction(SIGPIPE, &act, 0);
 
             /*
               Make fishd save and exit on the TERM signal.
@@ -682,7 +695,7 @@ static void daemonize()
     }
 
     /*
-      Put ourself in out own processing group
+      Put ourself in our own process group
     */
     setsid();
 
@@ -922,7 +935,7 @@ int main(int argc, char ** argv)
                 exit(0);
 
             case 'v':
-                debug(0, L"%ls, version %s\n", program_name, PACKAGE_VERSION);
+                debug(0, L"%ls, version %s\n", program_name, FISH_BUILD_VERSION);
                 exit(0);
 
             case '?':
