@@ -168,16 +168,16 @@ default through a simple mechanism called a redirection.
 An example of a file redirection is <code> echo hello \>output.txt</code>,
 which directs the output of the echo command to the file output.txt.
 
-- To redirect standard input, write <code>\<SOURCE_FILE</code>
-- To redirect standard output, write <code>\>DESTINATION</code>
-- To redirect standard error, write <code>^DESTINATION</code>
-- To redirect standard output to a file which will be appended, write <code>\>\>DESTINATION_FILE</code>
-- To redirect standard error to a file which will be appended, write <code>^^DESTINATION_FILE</code>
+- To read standard input from a file, write <code>\<SOURCE_FILE</code>
+- To write standard output to a file, write <code>\>DESTINATION</code>
+- To write standard error to a file, write <code>^DESTINATION</code>
+- To append standard output to a file, write <code>\>\>DESTINATION_FILE</code>
+- To append standard error to a file, write <code>^^DESTINATION_FILE</code>
 
 <code>DESTINATION</code> can be one of the following:
 
 - A filename. The output will be written to the specified file.
-- An ampersand (\&) followed by the number of another file descriptor. The file descriptor will be a duplicate of the specified file descriptor.
+- An ampersand (\&) followed by the number of another file descriptor. The output will be written to that file descriptor instead.
 - An ampersand followed by a minus sign (\&-). The file descriptor will be closed.
 
 Example:
@@ -186,15 +186,16 @@ To redirect both standard output and standard error to the file
 all_output.txt, you can write <code>echo Hello \>all_output.txt
 ^\&1</code>.
 
-Any FD can be redirected in an arbitrary way by prefixing the
-redirection with the number of the FD.
+Any file descriptor can be redirected in an arbitrary way by prefixing the
+redirection with the file descriptor.
 
-- To redirect input of FD number N, write <code>N\<DESTINATION</code>
-- To redirect output of FD number N, write <code>N\>DESTINATION</code>
-- To redirect output of FD number N to a file which will be appended, write <code>N\>\>DESTINATION_FILE</code>
+- To redirect input of FD N, write <code>N\<DESTINATION</code>
+- To redirect output of FD N, write <code>N\>DESTINATION</code>
+- To append the output of FD N to a file, write <code>N\>\>DESTINATION_FILE</code>
 
-Example: <code>echo Hello 2\>-</code> and <code>echo Hello ^-</code> are
-equivalent.
+Example: <code>echo Hello 2\>output.stderr</code> and <code>echo Hello
+^output.stderr</code> are equivalent, and write the standard error (file
+descriptor 2) of the target program to <code>output.stderr</code>.
 
 \subsection piping Piping
 
@@ -413,7 +414,7 @@ command line.
 These are the general purpose tab completions that \c fish provides:
 
 - Completion of commands (builtins, functions and regular programs).
-- Completion of environment variable names.
+- Completion of shell variable names.
 - Completion of usernames for tilde expansion.
 - Completion of filenames, even on strings with wildcards such as '*', '**' and '?'.
 - Completion of job ID, job name and process names for <a href="#expand-process">process expansion</a>.
@@ -559,7 +560,7 @@ undergoes the process of parameter expansion before it is sent on to
 the command. Parameter expansion is a powerful mechanism that
 allows you to expand the parameter in various ways, including
 performing wildcard matching on files, inserting the value of
-environment variables into the parameter or even using the output of
+a shell variable into the parameter or even using the output of
 another command as a parameter list.
 
 \subsection expand-wildcard Wildcards
@@ -634,10 +635,10 @@ The command <code>mv *.{c,h} src/</code> moves all files with the suffix
 
 \subsection expand-variable Variable expansion
 
-A dollar sign followed by a string of characters is expanded into the
-value of the environment variable with the same name. For an
-introduction to the concept of environment variables, read the <a
-href="#variables">Environment variables</a> section.
+A dollar sign followed by a string of characters is expanded into the 
+value of the shell variable with the same name. For an 
+introduction to the concept of shell variables, read the 
+<a href="#variables">Shell variables</a> section.
 
 Undefined and empty variables expand to nothing.
 
@@ -699,7 +700,7 @@ instead be expressed as <code>$$foo[1][5]</code>.
 
 \subsection expand-index-range Index range expansion
 
-Both command substitution and environment variables support accessing only 
+Both command substitution and shell variable expansion support accessing only 
 specific items by providing a set of indices in square brackets. It's 
 often needed to access a sequence of elements. To do this, use the range
 operator '..' for this. A range <code>'a..b'</code>, where range limits 'a'
@@ -799,10 +800,12 @@ If the current directory contains the files 'foo' and 'bar', the command
 will output 'abar1 abar2 abar3 afoo1 afoo2 afoo3'.
 
 
-\section variables Environment variables
+\section variables Shell variables
 
-Environment variables are named pieces of data, which can be created, deleted
-and their values changed and used by the user.
+Shell variables are named pieces of data, which can be created, deleted
+and their values changed and used by the user.  Variables may optionally be "exported", so
+that a copy of the variable is available to any subprocesses the shell creates. An
+exported variable is referred to as an "environment variable".
 
 To set a variable value, use the <a href="commands.html#set"> \c set
 command</a>.
@@ -1006,6 +1009,7 @@ values of most of these variables.
 - \c PWD, the current working directory.
 - \c status, the <a href="#variables-status">exit status</a> of the last foreground job to exit. If the job was terminated through a signal, the exit status will be 128 plus the signal number.
 - \c USER, the current username. This variable can only be changed by the root user.
+- \c CMD_DURATION, the runtime of the last command in milliseconds.
 
 The names of these variables are mostly derived from the csh family of
 shells and differ from the ones used by Bourne style shells such as
@@ -1118,7 +1122,11 @@ The \c fish editor features copy and paste, a searchable history and
 many editor functions that can be bound to special keyboard
 shortcuts.
 
-Here are some of the commands available in the editor:
+Similar to bash, fish has Emacs and Vi editing modes. The default
+editing mode is Emacs. You can switch to Vi mode with \c fish_vi_key_bindings
+and switch back with \c fish_default_key_bindings.
+
+\subsection emacs-mode Emacs mode commands
 
 - Tab <a href="#completion">completes</a> the current token.
 - Home or Ctrl-A moves the cursor to the beginning of the line.
@@ -1144,6 +1152,24 @@ Here are some of the commands available in the editor:
 
 You can change these key bindings using the
 <a href="commands.html#bind">bind</a> builtin command.
+
+\subsection vi-mode Vi mode commands
+
+Vi mode allows for the use of Vi-like commands when at the bash prompt.
+You'll initially be in insert mode. Hitting the escape key takes you
+into command mode where you can use, but aren't limited to, the following.
+
+- h moves cursor left
+- l moves cursor right
+- A moves cursor to end of line and put in insert mode
+- 0 (zero) Move cursor to beginning of line (doesn't put in insert mode)
+- i put into insert mode at current position
+- a put into insert mode after current position
+- dd Delete line (saved for pasting)
+- D delete text after current cursor position (saved for pasting)
+- p paste text that was deleted
+- u undo
+- etc for many of the other Vi commands
 
 \subsection killring Copy and paste (Kill Ring)
 
@@ -1302,25 +1328,38 @@ executed or put into the foreground and the output is used as a
 titlebar message. The $_ environment variable will always contain the
 name of the job to be put into the foreground (Or 'fish' if control is
 returning to the shell) when the \c fish_prompt function is called.
+The first argument to fish_title will contain the most
+recently executed foreground command as a string, starting with fish 2.2.
 
-Example:
+Examples:
 <p>
 The default \c fish title is
 </p>
 <p>
 <pre>
 function fish_title
-	echo $_ ' '
-	pwd
+    echo $_ ' '
+    pwd
+end
+</pre>
+</p>
+
+<p>
+To show the last command in the title:
+</p>
+<p>
+<pre>
+function fish_title
+    echo $argv[1]
 end
 </pre>
 </p>
 
 \subsection greeting Configurable greeting
 
-If a function named fish_greeting exists after initialization, it will
-be run when entering interactive mode. Otherwise,if an environment
-variable named fish_greeting exists, it will be printed.
+If a function named \c fish_greeting exists, it will be run when entering
+interactive mode. Otherwise, if an environment variable named \c fish_greeting
+exists, it will be printed.
 
 \subsection event Event handlers
 

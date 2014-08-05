@@ -157,6 +157,10 @@ extern bool g_profiling_active;
 */
 extern const wchar_t *program_name;
 
+/* Variants of read() and write() that ignores return values, defeating a warning */
+void read_ignore(int fd, void *buff, size_t count);
+void write_ignore(int fd, const void *buff, size_t count);
+
 /**
    This macro is used to check that an input argument is not null. It
    is a bit lika a non-fatal form of assert. Instead of exit-ing on
@@ -180,10 +184,10 @@ extern const wchar_t *program_name;
 */
 #define FATAL_EXIT()											\
 	{															\
-		char exit_read_buff;			\
-		show_stackframe();										\
-		read( 0, &exit_read_buff, 1 );			\
-		exit_without_destructors( 1 );												\
+        char exit_read_buff;                                    \
+        show_stackframe();										\
+        read_ignore( 0, &exit_read_buff, 1 );                   \
+        exit_without_destructors( 1 );                          \
 	}															\
  
 
@@ -533,6 +537,22 @@ public:
 
 bool is_forked_child();
 
+
+class mutex_lock_t
+{
+    public:
+    pthread_mutex_t mutex;
+    mutex_lock_t()
+    {
+        pthread_mutex_init(&mutex, NULL);
+    }
+    
+    ~mutex_lock_t()
+    {
+        pthread_mutex_destroy(&mutex);
+    }
+};
+
 /* Basic scoped lock class */
 class scoped_lock
 {
@@ -547,6 +567,7 @@ public:
     void lock(void);
     void unlock(void);
     scoped_lock(pthread_mutex_t &mutex);
+    scoped_lock(mutex_lock_t &lock);
     ~scoped_lock();
 };
 
@@ -629,7 +650,7 @@ char **wcsv2strv(const wchar_t * const *in);
    \return null if this is a valid name, and a pointer to the first invalid character otherwise
 */
 
-wchar_t *wcsvarname(const wchar_t *str);
+const wchar_t *wcsvarname(const wchar_t *str);
 
 
 /**
@@ -844,6 +865,9 @@ bool is_forked_child(void);
 void assert_is_not_forked_child(const char *who);
 #define ASSERT_IS_NOT_FORKED_CHILD_TRAMPOLINE(x) assert_is_not_forked_child(x)
 #define ASSERT_IS_NOT_FORKED_CHILD() ASSERT_IS_NOT_FORKED_CHILD_TRAMPOLINE(__FUNCTION__)
+
+/** Macro to help suppress potentially unused variable warnings */
+#define USE(var) (void)(var)
 
 extern "C" {
     __attribute__((noinline)) void debug_thread_error(void);

@@ -1400,8 +1400,6 @@ POSSIBILITY OF SUCH DAMAGES.
 
 <P>
 
-*/
-
 <h2>License for UTF8</h2>
 
 <p>Copyright (c) 2007 Alexey Vatchenko <av@bsdua.org>
@@ -1419,3 +1417,4 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 \htmlonly </div> \endhtmlonly
+*/

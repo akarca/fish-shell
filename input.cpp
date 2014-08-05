@@ -156,7 +156,7 @@ static const wchar_t * const name_arr[] =
 
 wcstring describe_char(wint_t c)
 {
-    wchar_t initial_cmd_char = R_BEGINNING_OF_LINE;
+    wint_t initial_cmd_char = R_BEGINNING_OF_LINE;
     size_t name_count = sizeof name_arr / sizeof *name_arr;
     if (c >= initial_cmd_char && c < initial_cmd_char + name_count)
     {
@@ -710,7 +710,7 @@ wint_t input_readch()
             {
                 case R_EOF: /* If it's closed, then just return */
                 {
-                    return WEOF;
+                    return R_EOF;
                 }
                 case R_SELF_INSERT:
                 {
@@ -1004,7 +1004,7 @@ bool input_terminfo_get_sequence(const wchar_t *name, wcstring *out_seq)
 
 }
 
-bool input_terminfo_get_name(const wcstring &seq, wcstring &name)
+bool input_terminfo_get_name(const wcstring &seq, wcstring *out_name)
 {
     input_init();
 
@@ -1020,7 +1020,7 @@ bool input_terminfo_get_name(const wcstring &seq, wcstring &name)
         const wcstring map_buf = format_string(L"%s",  m.seq);
         if (map_buf == seq)
         {
-            name = m.name;
+            out_name->assign(m.name);
             return true;
         }
     }

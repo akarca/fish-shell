@@ -64,8 +64,8 @@ public:
     {
     }
 
-    /* Inserts the string at the cursor position */
-    void insert_string(const wcstring &str);
+    /* Inserts a substring of str given by start, len at the cursor position */
+    void insert_string(const wcstring &str, size_t start = 0, size_t len = wcstring::npos);
 };
 
 /**
@@ -116,8 +116,10 @@ void reader_pop_current_filename();
    Write the title to the titlebar. This function is called just
    before a new application starts executing and just after it
    finishes.
+
+   \param cmd Command line string passed to \c fish_title if is defined.
 */
-void reader_write_title();
+void reader_write_title(const wcstring &cmd);
 
 /**
    Call this function to tell the reader that a repaint is needed, and
